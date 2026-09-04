@@ -1,0 +1,22 @@
+[Unit]
+Description=Сервер эмбеддингов для RAG-индексов (CPU, без VRAM)
+After=default.target
+
+[Service]
+# CUDA_VISIBLE_DEVICES пуст намеренно: с -ngl 0 llama.cpp всё равно держит
+# ~1.6 ГБ контекста CUDA. Пустая переменная даёт честный ноль VRAM и на
+# коротких запросах даже быстрее (38 мс против 56).
+Environment=CUDA_VISIBLE_DEVICES=
+# --parallel 1 обязателен: с дефолтом (4) процесс держал 7.7 ГБ RSS вместо 1.1.
+ExecStart=/usr/bin/llama-server \
+  -m /home/q/storage/ai/models/embed/Qwen3-Embedding-0.6B-Q8_0.gguf \
+  --embedding --pooling last --ctx-size 2048 \
+  --batch-size 2048 --ubatch-size 2048 \
+  --threads 4 --parallel 1 \
+  --host 127.0.0.1 --port 8091
+Restart=on-failure
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=default.target

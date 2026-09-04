@@ -1,0 +1,9 @@
+[Unit]
+Description=Пересборка историй сессий и дневника локального агента
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/q/storage/ai/bin/update.sh 3
+Nice=10
+IOSchedulingClass=idle

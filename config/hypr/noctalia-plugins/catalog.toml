@@ -1,0 +1,30 @@
+# Local plugin source. Point Noctalia at this directory with:
+#   noctalia msg plugins source add local path ~/.config/hypr/noctalia-plugins
+
+[[plugin]]
+id = "q/gamepad-launcher"
+name = "Gamepad Launcher"
+version = "1.1.0"
+updated_at = 1787310483
+added_at = 1755624000
+author = "q"
+license = "MIT"
+icon = "device-gamepad-2"
+description = "Full-width strip of hand-picked game covers, opened and steered from the gamepad."
+deprecated = false
+plugin_api = 18
+tags = ["gaming", "launcher"]
+
+[[plugin]]
+id = "q/ai-triage"
+name = "AI Triage"
+version = "1.0.0"
+updated_at = 1788528000
+added_at = 1788528000
+author = "q"
+license = "MIT"
+icon = "checklist"
+description = "Разбор сессий Claude и прогонов Qwen: что из них класть в поисковый индекс."
+deprecated = false
+plugin_api = 18
+tags = ["productivity"]

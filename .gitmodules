@@ -1,0 +1,6 @@
+[submodule "vendor/noctalia-gamepad-launcher"]
+	path = vendor/noctalia-gamepad-launcher
+	url = git@github.com:gudkovWay/noctalia-gamepad-launcher.git
+[submodule "vendor/noctalia-openrgb-sync"]
+	path = vendor/noctalia-openrgb-sync
+	url = git@github.com:gudkovWay/noctalia-openrgb-sync.git

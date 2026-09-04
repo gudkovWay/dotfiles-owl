@@ -1,0 +1,64 @@
+# Игры для геймпад-лаунчера (открывается тряской пада).
+# Порядок записей здесь = порядок карточек на экране.
+#
+# Для Steam-игры достаточно appid: название, обложка и команда запуска
+# подтянутся сами. Найти appid: ls ~/games/SteamLibrary/steamapps/
+#
+# После правки этого файла ничего перезапускать не надо — список
+# пересобирается при каждом открытии лаунчера.
+
+[[game]]
+appid = 244210      # Assetto Corsa
+
+# Лаунчер модов AC. appid указан только ради обложки — запуск идёт по exec,
+# потому что через Steam Content Manager падает при создании окна.
+[[game]]
+name = "Content Manager"
+appid = 244210
+exec = "/home/q/games/content-manager.sh"
+
+[[game]]
+appid = 3058630     # Assetto Corsa EVO
+
+[[game]]
+appid = 635260      # CarX Drift Racing Online
+
+[[game]]
+appid = 227300      # Euro Truck Simulator 2
+
+[[game]]
+appid = 1222680     # Need for Speed Heat
+
+[[game]]
+appid = 1262580     # Need for Speed Payback
+
+[[game]]
+appid = 1328660     # Need for Speed Hot Pursuit Remastered
+
+# Не-Steam игра — укажи всё руками:
+# [[game]]
+# name = "War Thunder"
+# exec = "/usr/bin/warthunder"
+# cover = "~/Pictures/covers/warthunder.jpg"
+
+# Steam-игру, которую ещё не установил, тоже можно вписать: appid хватит,
+# обложка скачается с CDN, а запуск отдастся Steam — он предложит установить.
+# [[game]]
+# appid = 1938090   # Call of Duty
+
+# Не-Steam игра. appid указан только ради обложки — запуск идёт по exec,
+# а cwd нужен, чтобы лаунчер стартовал в своём каталоге.
+[[game]]
+name = "War Thunder"
+appid = 236390
+exec = "./launcher"
+cwd = "~/games/WarThunder"
+
+# --------------------------------------------------------------------------
+# Полный список (SUPER + G) собирается сам из установленных игр Steam плюс
+# всех записей выше. Тут — что из него выкинуть: рантаймы и Proton
+# отсеиваются по имени, остальное перечисляй по appid.
+[all]
+exclude = [
+  431960,           # Wallpaper Engine — не игра
+]

@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""qwen-watch — живой просмотр запросов к локальной модели.
+Одна строка = один запрос: тип, время, сколько токенов ушло и вернулось."""
+import os, re, sys, time
+
+LOG = os.environ.get("QWEN_LOG", os.path.expanduser("~/.local/state/qwen/server.log"))
+if not os.path.exists(LOG):
+    sys.exit(f"нет лога: {LOG}\nсервер запущен через `qwen-serve --router`?")
+
+RE_PROMPT = re.compile(r"prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens")
+RE_EVAL   = re.compile(r"^(?!.*prompt).*\beval time =\s*([\d.]+) ms /\s*(\d+) tokens")
+RE_TOTAL  = re.compile(r"total time =\s*([\d.]+) ms")
+RE_MODEL  = re.compile(r"proxying request to model (\S+)")
+RE_LOAD   = re.compile(r"loading model|model loaded")
+
+print(f"Слежу за {LOG}   (Ctrl+C чтобы выйти)\n")
+print(f"{'время':8}  {'тип':12} {'всего':>8}  {'промпт':>8}  {'ответ':>7}")
+print("─" * 52)
+
+st = {"model": "?", "pt": 0, "gt": 0}
+with open(LOG) as fh:
+    fh.seek(0, os.SEEK_END)
+    while True:
+        line = fh.readline()
+        if not line:
+            time.sleep(0.15); continue
+        if m := RE_MODEL.search(line):
+            st["model"] = m.group(1)
+        elif RE_LOAD.search(line):
+            print(f"{time.strftime('%H:%M:%S')}  \033[33m загружает модель…\033[0m")
+        elif m := RE_PROMPT.search(line):
+            st["pt"] = int(m.group(2))
+        elif m := RE_EVAL.search(line):
+            st["gt"] = int(m.group(2))
+        elif m := RE_TOTAL.search(line):
+            tot = float(m.group(1))
+            pt, gt = st["pt"], st["gt"]
+            # автокомплит: короткий промпт и короткий ответ
+            auto = gt <= 64 and pt <= 2048
+            kind = "\033[36mавтокомплит\033[0m" if auto else "\033[35mчат\033[0m"
+            pad  = 12 + 9  # компенсация ANSI
+            print(f"{time.strftime('%H:%M:%S')}  {kind:<{pad}} {tot:7.0f}мс  "
+                  f"{pt:6d} ток  {gt:5d} ток", flush=True)
+            st["pt"] = st["gt"] = 0

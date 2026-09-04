@@ -1,0 +1,7 @@
+*.bak
+*.bak-*
+*.bak2-*
+*.bak3-*
+*.bloated-*
+__pycache__/
+*.pyc

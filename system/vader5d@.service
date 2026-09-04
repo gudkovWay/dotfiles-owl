@@ -1,0 +1,11 @@
+[Unit]
+Description=Flydigi Vader 5 Pro Driver %i
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vader5d --device %i
+Restart=on-failure
+RestartSec=3
+Nice=-10
