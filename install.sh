@@ -28,10 +28,9 @@ link() {                       # link <источник в репе> <куда>
 }
 
 # ── ~/.config ──────────────────────────────────────────────────────────────
-for d in "$REPO"/config/*/; do
-  link "config/$(basename "$d")" "$CONFIG/$(basename "$d")"
-done
-link config/starship.toml "$CONFIG/starship.toml"
+while IFS= read -r -d '' f; do
+  link "$f" "$CONFIG/${f#config/}"
+done < <(git -C "$REPO" ls-files -z -- config)
 
 # ── плагины и скрипты из отдельных публичных реп ───────────────────────────
 # Подтягиваются сабмодулями: git submodule update --init

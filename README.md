@@ -66,7 +66,66 @@ cd ~/dev/dotfiles-owl
 ./install.sh
 ```
 
-`install.sh` симлинкует, а не копирует, и **никогда не затирает настоящий
-файл** на месте ссылки — про такой печатает `WARN`. Что требует root (юниты в
-`/etc/systemd/system`, udev-правила, демон пробуждения) он не делает сам, а
-печатает готовые команды.
+`install.sh` симлинкует каждый отслеживаемый конфиг-файл **по отдельности** в
+`${XDG_CONFIG_HOME:-$HOME/.config}`: директории назначения остаются настоящими,
+а уже живущие там runtime-файлы, которых нет в репозитории, не трогаются.
+Симлинк, а не копия, и **никогда не затирание настоящего файла** на месте
+ссылки — про такой печатается `WARN`. Что требует root (юниты в
+`/etc/systemd/system`, udev-правила, демон пробуждения), скрипт не делает сам,
+а печатает готовые команды.
+
+Если в `~/.config` уже лежит настоящий файл с тем же путём, установщик его
+не тронет — напечатает `WARN` и оставит как есть. Разовый перенос на
+версию из репозитория (пример — `kitty/kitty.conf`):
+
+```sh
+diff ~/.config/kitty/kitty.conf config/kitty/kitty.conf
+mv ~/.config/kitty/kitty.conf ~/.config/kitty/kitty.conf.local-bak
+./install.sh
+readlink -f ~/.config/kitty/kitty.conf   # убедиться, что это симлинк в репозиторий
+rm ~/.config/kitty/kitty.conf.local-bak
+```
+
+Эта процедура — только для обычных конфигов из репозитория. Никогда не
+применяйте её к app-native хранилищам токенов и к приватному хранилищу
+ключей `~/.config/dotfiles-owl-private/`.
+
+### Ключи: приватное хранилище
+
+Секреты живут **вне репозитория**, в отдельной директории
+`~/.config/dotfiles-owl-private/`. Fish-лоадер `config/fish/conf.d/api-keys.fish`
+при старте молча читает оттуда сырые файлы ключей и экспортирует
+`DEEPSEEK_API_KEY` и `ZAI_API_KEY`; нет файла или файл пуст — переменная просто
+не выставляется.
+
+```sh
+mkdir -p ~/.config/dotfiles-owl-private/keys
+chmod 700 ~/.config/dotfiles-owl-private ~/.config/dotfiles-owl-private/keys
+touch ~/.config/dotfiles-owl-private/keys/deepseek ~/.config/dotfiles-owl-private/keys/zai
+chmod 600 ~/.config/dotfiles-owl-private/keys/deepseek ~/.config/dotfiles-owl-private/keys/zai
+micro ~/.config/dotfiles-owl-private/keys/deepseek   # вставить ключ в редакторе
+micro ~/.config/dotfiles-owl-private/keys/zai
+```
+
+Значение ключа вводите в редакторе (`micro`, `nano`, …) или через
+`read -s VAR && printf %s "$VAR" > файл` — не через `echo 'sk-…' > файл`,
+иначе ключ останется в истории shell.
+
+Реальные значения ключей **никогда не попадают в репозиторий** — ни в файлы,
+ни в команды коммитов, ни в примеры из этого README. Вне репозитория остаются и
+app-native хранилища токенов (token/auth store приложений): они относятся к
+живой машине, а не к слепку конфигов.
+
+### Проверка секретов
+
+Pre-commit хук и Gitleaks ловят случайные ключи до и после коммита:
+
+```sh
+pre-commit install                     # включить pre-commit хук (стейдж проверяет он)
+gitleaks dir .                         # текущие файлы
+gitleaks git .                         # история репозитория
+```
+
+CI-сканирование (`.github/workflows/gitleaks.yml`) запускается на push и
+pull_request — локальных проверок достаточно, чтобы не доводить до красного
+пайплайна.
