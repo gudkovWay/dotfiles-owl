@@ -1,3 +1,4 @@
+# Editor / build artifacts
 *.bak
 *.bak-*
 *.bak2-*
@@ -5,3 +6,60 @@
 *.bloated-*
 __pycache__/
 *.pyc
+
+# Local dotenv files, anywhere in the tree (tracked example stays visible)
+**/.env
+**/.env.*
+!**/.env.example
+
+# Sensitive local state anywhere in the tree
+**/.claude/
+**/.ssh/
+**/.gnupg/
+**/token
+**/hook-secret
+**/credentials.json
+**/hosts.yml
+**/sc-auth.json
+**/Cookies*
+**/cookies.sqlite*
+**/logins.json
+**/key4.db
+**/fish_history
+**/history.jsonl
+
+# Claude credential / local state (checkout mirrors)
+.claude/.credentials.json
+.claude/settings.local.json
+claude/.credentials.json
+claude/settings.local.json
+
+# Fish runtime state and local key files
+config/fish/fish_variables
+config/fish/conf.d/deepseek.fish
+config/fish/conf.d/zai.fish
+
+# Private config trees with machine/credential content
+config/remote-ai/
+config/chat-bot/
+config/bidlobot/
+config/gh/
+config/glab-cli/
+config/incy/
+config/soundcloud-desktop/
+config/pulse/
+config/zen/
+config/mozilla/
+config/discord/
+config/Throne/
+config/netbird/
+config/NetBird/
+
+# OpenRGB runtime state
+config/OpenRGB/logs/
+config/OpenRGB/Configuration.json
+config/OpenRGB/profiles/
+
+# External private key store copied into the checkout
+dotfiles-owl-private/
+config/dotfiles-owl-private/

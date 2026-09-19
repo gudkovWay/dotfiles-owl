@@ -1,0 +1,18 @@
+dotfiles-owl-private.example
+
+This file documents the layout of the private key store that lives OUTSIDE
+this repository, under:
+
+    ${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles-owl-private/
+
+Layout:
+
+    keys/
+        deepseek    # raw key file for DEEPSEEK_API_KEY
+        zai         # raw key file for ZAI_API_KEY
+
+Each file contains only the raw key value. Missing, unreadable, or empty
+files leave the corresponding environment variable unset.
+
+No values are stored in this repository. Never commit real key material or a
+copy of the private store here.

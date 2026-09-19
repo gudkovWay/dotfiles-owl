@@ -8,32 +8,6 @@
       "$defaults",
       "Bash(hyprctl:*)",
       "Bash(vulkaninfo:*)"
-    ],
-    "environment": [
-      "### Org-wide",
-      "**Organization**: None configured",
-      "**Cloud provider(s)**: None configured",
-      "**Repository visibility**: assume private unless the remote host and repo name indicate otherwise, or a visibility check in the transcript shows public — no remotes are configured for /home/q, so nothing is publishable from here without a remote being added first",
-      "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
-      "**Secrets management**: None configured",
-      "**Default / protected branches**: unknown — origin/HEAD is unset and no remote exists, so no branch protection could be queried",
-      "**CI/CD deploy targets**: None configured",
-      "**Network posture**: None configured",
-      "**Source control**: The trusted repo and its remote(s) only (no additional orgs configured) — as scoped by the Trusted repo and Repository visibility entries above; this repo currently has no remotes",
-      "**Trusted internal domains**: None configured",
-      "**Trusted cloud buckets**: None configured",
-      "**Key internal services**: None configured",
-      "**Internal package registry**: None configured",
-      "**Sensitive data locations & audiences**: any file or store holding personal data, confidential business data, credentials, regulated data, or similarly sensitive material; preserve exact handles when known and share only with audiences cleared at the [named+specifics] bar. In this checkout specifically: ~/.claude/.credentials.json, ~/dev/p2p-docs/.env.example, and fish shell history are credential-bearing or personal and are not shareable material",
-      "**Data retention / declassification**: None configured",
-      "**Sensitive remote targets**: any namespace, host, or container whose name carries `prod` or `production` as a whole word or name segment (hyphen/underscore/dot-delimited — e.g. matches `prod-db`, not `producer`)",
-      "**Protected deployment namespaces / environments**: None configured — fall back to the Sensitive remote targets heuristic",
-      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries `prod` or `production` as a whole word or name segment",
-      "### User-specific",
-      "**Primary use of Claude Code**: software development, with a strong local-workstation/system-administration slant — recent activity is Linux desktop and disk work (hyprctl, vulkaninfo, nft, lsblk/parted/mkfs/wipefs, yay/pacman)",
-      "**Trusted repo**: /home/q — the git repository the agent started in (its working directory) and its configured remote(s); it currently has zero tracked files and no remotes, so treat it as a scratch/home checkout rather than a project with a publishing destination. When the repo's public/private visibility is given — by the Repository visibility entry or the user's own message — use it to scope what is OK to commit or push there: confidential material is fine in a private repo; in a public one, only that repo's own work is — and content ported, repointed, or first read from outside this session's repo is not its own work, whoever directed the port. Visibility scopes confidential material only: secrets and sensitive data (personal & entrusted) are never cleared into any repo by its visibility (see Definitions).",
-      "**Org-specific CLIs**: None configured — non-standard CLIs seen are general-purpose local tools (strings, hyprctl, file, nft, uname, vulkaninfo)",
-      "**Routine under prefix**: no org or user path prefix is evidenced; nothing is pre-trusted by path"
     ]
   },
   "hooks": {
@@ -43,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/q/.claude/hooks/no-claude-trailers.sh"
+            "command": "$HOME/.claude/hooks/no-claude-trailers.sh"
           }
         ]
       }
