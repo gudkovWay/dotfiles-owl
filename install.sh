@@ -61,6 +61,11 @@ link claude/settings.json "$HOME/.claude/settings.json"
 link claude/CLAUDE.md     "$HOME/.claude/CLAUDE.md"
 link claude/hooks         "$HOME/.claude/hooks"
 
+# ── OMP ────────────────────────────────────────────────────────────────────
+# Только отслеживаемый файл расширения; дерево ~/.omp (базы, сессии, логи)
+# остаётся локальным и в репозиторий не попадает.
+link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
+
 $DRY && exit 0
 
 systemctl --user daemon-reload
