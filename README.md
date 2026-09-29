@@ -14,10 +14,12 @@ config/          всё, что уезжает в ~/.config
   fish kitty alacritty noctalia zed micro yazi rofi btop lazygit …
   vader5/        конфиг драйвера геймпада (Numpad 1-6 на доп. кнопках)
   llama-cpp/     список локальных моделей для qwen-serve
+  nvim/          живой конфиг Neovim (lazy-lock.json — источник правды)
   OpenRGB/       профиль и раскладка устройств (без логов)
 systemd/user/    ai-embed, ai-journal + таймер
 system/          юниты и udev-правила, которым нужен root
 local/bin/       qwen-serve, qwen-watch — обвязка локальной модели
+omp/extensions/  статус-строка OMP: рендер пути с worktree и корневой иконкой
 claude/          settings.json, CLAUDE.md, хук про трейлеры в коммитах
 vendor/          сабмодули: то, что вынесено в свои публичные репозитории
 install.sh
@@ -34,6 +36,17 @@ install.sh
   — палитра Noctalia уезжает в подсветку
 
 `ai-triage` остался здесь: он завязан на `~/storage/ai` и отдельно не живёт.
+
+## Neovim и OMP
+
+`config/nvim` — живой конфиг Neovim: `install.sh` симлинкует его файлы в
+`~/.config/nvim` тем же механизмом «отдельный симлинк на каждый файл». Из OMP
+ставится ровно один файл: `omp/extensions/statusline-path.ts` линкуется в
+`~/.omp/agent/extensions/statusline-path.ts` — это рендер сегмента пути
+статус-строки (basename проекта, у worktree — проект, разделитель и имя
+worktree, иконка по корню каталога запуска). Всё остальное дерево `~/.omp` —
+базы, сессии, логи — это локальное runtime-состояние: оно не симлинкуется и в
+репозиторий не попадает.
 
 ## Из чего это состоит, если по существу
 
