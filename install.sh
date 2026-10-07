@@ -61,10 +61,16 @@ link claude/settings.json "$HOME/.claude/settings.json"
 link claude/CLAUDE.md     "$HOME/.claude/CLAUDE.md"
 link claude/hooks         "$HOME/.claude/hooks"
 
+# ── Тема курсора и совместимый Xcursor fallback ─────────────────────────────
+link local/share/icons/Dot-Dark "$HOME/.local/share/icons/Dot-Dark"
+link local/share/icons/Dot-Dark "$HOME/.icons/Dot-Dark"
+
 # ── OMP ────────────────────────────────────────────────────────────────────
-# Только отслеживаемый файл расширения; дерево ~/.omp (базы, сессии, логи)
+# Только отслеживаемые расширения; дерево ~/.omp (базы, сессии, логи)
 # остаётся локальным и в репозиторий не попадает.
 link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
+link omp/extensions/prompt-card "$HOME/.omp/agent/extensions/prompt-card"
+link omp/extensions/image-links.ts "$HOME/.omp/agent/extensions/image-links.ts"
 
 $DRY && exit 0
 
