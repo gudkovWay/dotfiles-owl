@@ -1,0 +1,8 @@
+# Разовый проход ночного режима: рампа яркости, температура, LED.
+# Движется systemd-таймером (night-mode.timer), сам циклов не держит.
+[Unit]
+Description=Night mode ramp: monitor brightness (ddcutil), color temperature (hyprsunset), LED dim
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/hypr/scripts/night-mode.sh
