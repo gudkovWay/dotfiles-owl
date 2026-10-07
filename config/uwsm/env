@@ -1,0 +1,16 @@
+export BROWSER=zen-browser
+export TERM=xterm-kitty
+export QT_QPA_PLATFORM="wayland;xcb"
+export QT_QPA_PLATFORMTHEME="qt6ct"
+export ELECTRON_OZONE_PLATFORM_HINT=auto
+export HYPRCURSOR_THEME="Bibata-Modern-Ice"
+export HYPRCURSOR_SIZE=24
+export XCURSOR_THEME="Dot-Dark"
+export XCURSOR_SIZE=24
+
+# NVIDIA (driver 610.x). GBM_BACKEND / __GLX_VENDOR_LIBRARY_NAME are not needed
+# on modern drivers and can break things, so they stay off.
+export __GL_GSYNC_ALLOWED=1 # allow G-Sync/VRR on capable monitors
+export __GL_VRR_ALLOWED=1 # allow VRR outside of G-Sync certified mode
+export LIBVA_DRIVER_NAME=nvidia # VA-API hardware video decode
+export NVD_BACKEND=direct # NVDEC direct backend (no GBM roundtrip)
