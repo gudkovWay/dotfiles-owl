@@ -62,9 +62,16 @@ link claude/CLAUDE.md     "$HOME/.claude/CLAUDE.md"
 link claude/hooks         "$HOME/.claude/hooks"
 
 # ── OMP ────────────────────────────────────────────────────────────────────
-# Только отслеживаемый файл расширения; дерево ~/.omp (базы, сессии, логи)
-# остаётся локальным и в репозиторий не попадает.
+# Только отслеживаемые расширения и authored workflow-файлы. Базы, сессии,
+# receipts, provider config и секреты ~/.omp остаются локальными.
 link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
+link omp/extensions/jev-shadow.ts "$HOME/.omp/agent/extensions/jev-shadow.ts"
+while IFS= read -r -d '' f; do
+  link "$f" "$HOME/.omp/agent/${f#omp/}"
+done < <(git -C "$REPO" ls-files -z -- omp/hooks omp/rules omp/skills omp/jev)
+while IFS= read -r -d '' f; do
+  link "$f" "$HOME/.agents/${f#agents/}"
+done < <(git -C "$REPO" ls-files -z -- agents/skills)
 
 $DRY && exit 0
 
