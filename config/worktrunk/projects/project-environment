@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Readiness, pinned dependencies and targeted Nuxt prepare; no implicit install."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+GUARD = HERE / 'guarded-run'
+LIFECYCLES = {
+    'esbuild': {'postinstall': 'node install.js'},
+    '@swc/core': {'postinstall': 'node postinstall.js'},
+    'better-sqlite3': {'install': 'prebuild-install || node-gyp rebuild --release'},
+    '@parcel/watcher': {'install': 'node scripts/build-from-source.js'},
+    'vue-demi': {'postinstall': 'node -e "try{require(\'./scripts/postinstall.js\')}catch(e){}"'},
+}
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def git(*args):
+    return subprocess.check_output(['git', *args], text=True).strip()
+
+
+def identity(root):
+    remote = git('remote', 'get-url', 'origin').removesuffix('.git')
+    if remote.endswith('common/frontend/frontend'):
+        return 'p2p'
+    if remote.endswith('ecom/frontend/frontend'):
+        return 'ecom'
+    fail('repository is not a registered p2p/ecom npm workspace')
+
+
+def read_json(path):
+    return json.loads(path.read_text())
+
+
+def dependencies_key(root):
+    paths = [root / 'package-lock.json', root / 'package.json']
+    paths += sorted(root.glob('apps/*/package.json')) + sorted(root.glob('lib/*/package.json'))
+    node = subprocess.check_output(['node', '--print',
+        'JSON.stringify({node:process.version,abi:process.versions.modules,platform:process.platform,arch:process.arch})'], text=True)
+    h = hashlib.sha256(node.encode())
+    for path in paths:
+        h.update(str(path.relative_to(root)).encode())
+        h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def profile_commands(repo, profile):
+    if profile == 'admin-tests':
+        if repo != 'p2p':
+            fail('ecom has no verified admin test entrypoint; do not borrow p2p test:admin')
+        return [['npm', 'run', 'prepare:common'], ['npm', 'run', 'prepare:admin']]
+    return [['npm', 'run', 'prepare:common'], ['npm', 'run', 'prepare:admin'],
+            ['npm', 'exec', '--offline', '--', 'nuxt', 'prepare', '--cwd', 'apps/payscrow-admin']]
+
+
+def generated_key(root, profile, depkey):
+    h = hashlib.sha256(depkey.encode())
+    dirs = ['lib/common-layer', 'lib/admin-layer']
+    if profile == 'admin-ui':
+        dirs.append('apps/payscrow-admin')
+    for directory in dirs:
+        base = root / directory
+        for current, directories, files in os.walk(base):
+            directories[:] = sorted(d for d in directories if d not in {'.nuxt', '.output', '.playground', 'node_modules', '.git'})
+            for name in sorted(files):
+                path = Path(current) / name
+                if path.suffix not in {'.ts', '.mts', '.vue'} or name.endswith(('.test.ts', '.spec.ts')):
+                    continue
+                h.update(str(path.relative_to(root)).encode())
+                # CSS/template edits do not change auto-import registry; TS/config edits can.
+                if path.suffix != '.vue':
+                    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def runtime_issue(root):
+    sqlite = read_json(root / 'package-lock.json').get('packages', {}).get('node_modules/better-sqlite3', {})
+    engines = sqlite.get('engines', {}).get('node', '')
+    version = subprocess.check_output(['node', '--print', 'process.versions.node'], text=True).strip()
+    # Both reviewed lockfiles express SQLite support as an explicit list of majors.
+    if re.fullmatch(r'\d+\.x(?:\s*\|\|\s*\d+\.x)*', engines):
+        if int(version.split('.')[0]) not in [int(n) for n in re.findall(r'(\d+)\.x', engines)]:
+            return f'Node {version} is outside better-sqlite3@{sqlite["version"]} declared engines ({engines}); warning, not proof of a runtime failure'
+    return None
+
+
+def workspace_links_ready(root):
+    for path, entry in read_json(root / 'package-lock.json').get('packages', {}).items():
+        if entry.get('link'):
+            link = root / path
+            if not link.is_symlink() or link.resolve() != (root / entry['resolved']).resolve():
+                return False
+    return True
+
+
+def ready(root, profile, key):
+    dep_stamp = root / 'node_modules/.omp-environment.json'
+    metadata = read_json(dep_stamp) if dep_stamp.exists() else {}
+    issue = runtime_issue(root)
+    deps = (metadata.get('schema') == 2 and metadata.get('key') == key and
+            metadata.get('native_profile') == 'nuxt-admin' and workspace_links_ready(root))
+    stamp = root / '.superpowers/environment' / (profile + '.json')
+    targets = ['lib/common-layer/.nuxt/tsconfig.json', 'lib/admin-layer/.nuxt/tsconfig.json']
+    if profile == 'admin-ui':
+        targets.append('apps/payscrow-admin/.nuxt/tsconfig.json')
+    generated = deps and stamp.exists() and read_json(stamp).get('key') == generated_key(root, profile, key) and all((root / p).is_file() for p in targets)
+    return {'dependencies': 'ready' if deps else ('unverified' if (root / 'node_modules').exists() else 'missing'),
+            'generated': 'ready' if generated else 'missing-or-stale', 'required_generated': targets,
+            'runtime_warning': issue, 'dependency_scope': 'nuxt-admin; SQLite native lifecycle is not needed by these profiles'}
+
+
+def guard_owned():
+    if 'omp-heavy-job.scope' not in Path('/proc/self/cgroup').read_text():
+        fail('internal execution requires the guarded scope')
+
+
+def nuxtrc_snapshot(root):
+    names = subprocess.check_output(['git', 'ls-files', '-z', '--', '**/.nuxtrc', '.nuxtrc']).decode().split('\0')
+    return {name: (root / name).read_bytes() if (root / name).exists() else None for name in names if name}
+
+
+def native(root, command):
+    before = nuxtrc_snapshot(root)
+    result = subprocess.run(command, cwd=root, env={**os.environ, 'NODE_ENV': 'test'})
+    changed = []
+    for name, data in before.items():
+        path = root / name
+        now = path.read_bytes() if path.exists() else None
+        if now != data:
+            changed.append(name)
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(data)
+    if changed:
+        fail('tracked .nuxtrc mutated; restored pre-command contents: ' + ', '.join(changed))
+    if result.returncode:
+        fail(f'native command failed ({result.returncode}); no automatic retry: {command}')
+
+
+def install(root, key):
+    if read_json(root / 'package.json').get('scripts', {}).get('prepare') != 'husky':
+        fail('root prepare is not the reviewed Husky command')
+    lock = read_json(root / 'package-lock.json')
+    packages = lock.get('packages', {})
+    # Validate the known dependency set BEFORE materializing. No arbitrary package scripts.
+    allowed = set(LIFECYCLES) | {'unrs-resolver', 'fsevents'}
+    for path, entry in packages.items():
+        if not entry.get('hasInstallScript') or '/node_modules/' not in '/' + path:
+            continue
+        name = path.rsplit('node_modules/', 1)[-1]
+        if name not in allowed:
+            fail('unreviewed install-script package: ' + name)
+    # Reuse materialization already performed by this helper; repair native readiness
+    # without another npm ci. A directory without our matching stamp is not evidence.
+    stamp = root / 'node_modules/.omp-environment.json'
+    materialized = read_json(stamp) if stamp.exists() else {}
+    if materialized.get('key') != key or not workspace_links_ready(root):
+        native(root, ['npm', 'ci', '--prefer-offline', '--include=dev', '--ignore-scripts'])
+        stamp.write_text(json.dumps({'schema': 2, 'key': key, 'native_profile': None}) + '\n')
+    selected = set()
+    approvals = set()
+    for path, entry in packages.items():
+        if not entry.get('hasInstallScript') or 'node_modules/' not in path:
+            continue
+        name = path.rsplit('node_modules/', 1)[-1]
+        location = root / path / 'package.json'
+        if not location.exists():  # e.g. Darwin-only optional fsevents on Linux
+            continue
+        metadata = read_json(location)
+        if metadata.get('name') != name or metadata.get('version') != entry.get('version'):
+            fail('materialized package differs from the locked identity: ' + path)
+        if name == 'fsevents' and sys.platform != 'darwin':
+            continue
+        expected = LIFECYCLES.get(name)
+        if name == 'unrs-resolver':
+            expected = {'postinstall': f'napi-postinstall unrs-resolver {entry["version"]} check'}
+        actual = {k: v for k, v in metadata.get('scripts', {}).items() if k in {'preinstall', 'install', 'postinstall', 'prepare'}}
+        if actual != expected:
+            fail('lifecycle changed; approval required: ' + path)
+        # npm 12 cannot match version pins when the existing lockfile omits the
+        # registry resolved URL. Use its supported name-only policy in that case;
+        # the helper still checks every installed version and lifecycle above.
+        approvals.add(name + '@' + entry['version'] if entry.get('resolved') else name)
+        # Content/SQLite is enabled in form applications, not the reviewed admin
+        # roots. Do not compile an unrelated database binding for a CSS check.
+        if name == 'better-sqlite3':
+            continue
+        selected.add(name)
+    if selected:
+        # npm 12 rejects CLI/env allow-scripts for project installs. Use a private,
+        # ephemeral user config; never edit package.json, the project's .npmrc or
+        # the owner's permanent policy. Strict preflight covers the entire tree,
+        # but rebuild itself receives only the reviewed admin-native package names.
+        userconfig = Path(subprocess.check_output(['npm', 'config', 'get', 'userconfig'], text=True).strip())
+        original = userconfig.read_text() if userconfig.exists() else ''
+        projectconfig = (root / '.npmrc').read_text() if (root / '.npmrc').exists() else ''
+        if (read_json(root / 'package.json').get('allowScripts') or
+                re.search(r'^\s*allow-scripts', original + '\n' + projectconfig, re.M) or
+                any(k.lower().startswith('npm_config_allow_scripts') for k in os.environ)):
+            fail('existing install-script policy requires review; refusing to override it')
+        with tempfile.NamedTemporaryFile(mode='w', prefix='native-', suffix='.npmrc',
+                                         dir=root / '.superpowers/environment') as config:
+            config.write(original + '\n' + ''.join('allow-scripts[]=' + name + '\n' for name in sorted(approvals)))
+            config.flush()
+            native(root, ['npm', 'rebuild', *sorted(selected), '--foreground-scripts',
+                          '--ignore-scripts=false', '--strict-allow-scripts', '--userconfig=' + config.name])
+    # Root prepare is Husky, not workspace-wide Nuxt postinstall.
+    native(root, ['npm', 'run', 'prepare', '--ignore-scripts'])
+    stamp.write_text(json.dumps({'schema': 2, 'key': key, 'native_profile': 'nuxt-admin'}) + '\n')
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--profile', choices=['admin-ui', 'admin-tests'], default='admin-ui')
+    p.add_argument('--install', action='store_true')
+    p.add_argument('--prepare', action='store_true')
+    p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
+    args = p.parse_args()
+    root = Path(git('rev-parse', '--show-toplevel'))
+    os.chdir(root)
+    repo = identity(root)
+    if any((root / name).exists() for name in ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb']):
+        fail('non-npm lockfile present; refusing manager substitution')
+    for location in ['node_modules', 'lib/common-layer/.nuxt', 'lib/admin-layer/.nuxt', 'apps/payscrow-admin/.nuxt']:
+        if (root / location).is_symlink():
+            fail('shared writable dependency/generated path is not an owned environment: ' + location)
+    for directory in ['lib/common-layer', 'lib/admin-layer', 'apps/payscrow-admin']:
+        config = root / directory / 'nuxt.config.ts'
+        if config.exists() and '@nuxt/content' in config.read_text():
+            fail('admin profile now enables content/SQLite; review its native requirements rather than skipping that lifecycle')
+    key = dependencies_key(root)
+    commands = profile_commands(repo, args.profile)
+    status = ready(root, args.profile, key)
+    print(json.dumps({'repository': repo, 'root': str(root), 'profile': args.profile, **status,
+                     'install_needed': status['dependencies'] != 'ready',
+                     'prepare_commands': commands, 'runner': 'npm run test:admin -- <files>' if args.profile == 'admin-tests' else 'npm run dev -w payscrow-admin'}, ensure_ascii=False), flush=True)
+    if args.dry_run or not (args.install or args.prepare):
+        return
+    if not args.inside:
+        forwarded = [a for a in sys.argv[1:] if a != '--dry-run']
+        os.execv(str(GUARD), [str(GUARD), '--', sys.executable, str(Path(__file__).resolve()), '--inside', *forwarded])
+    guard_owned()
+    if subprocess.run(['git', 'check-ignore', '-q', '.superpowers/environment/probe']).returncode:
+        fail('.superpowers must be locally ignored before storing environment state')
+    state_dir = root / '.superpowers/environment'
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if args.install and status['dependencies'] != 'ready':
+        install(root, key)
+    if args.prepare:
+        status = ready(root, args.profile, key)
+        if status['dependencies'] != 'ready':
+            fail('dependencies are missing/unverified; use --install explicitly if needed')
+        if status['generated'] != 'ready':
+            stamp = state_dir / (args.profile + '.json')
+            current_key = generated_key(root, args.profile, key)
+            source_current = stamp.exists() and read_json(stamp).get('key') == current_key
+            for command, target in zip(commands, status['required_generated'], strict=True):
+                if not source_current or not (root / target).is_file():
+                    native(root, command)
+            missing = [target for target in status['required_generated'] if not (root / target).is_file()]
+            if missing:
+                fail('prepare exited successfully but required output is missing: ' + ', '.join(missing))
+            stamp.write_text(json.dumps({'key': current_key}) + '\n')
+    print('project-environment: requested prerequisites ready')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print('project-environment: refusing: ' + str(error), file=sys.stderr)
+        raise SystemExit(1)

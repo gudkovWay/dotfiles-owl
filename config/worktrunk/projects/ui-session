@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Finite loopback Nuxt + owned headless Chromium CDP, inside the shared guard."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+HERE = Path(__file__).resolve().parent
+GUARD = HERE / 'guarded-run'
+ENVIRONMENT = HERE / 'project-environment'
+
+
+def git(*args):
+    return subprocess.check_output(['git', *args], text=True).strip()
+
+
+def head_identity(git_dir, common_dir):
+    head = (git_dir / 'HEAD').read_text().strip()
+    if not head.startswith('ref: '):
+        return head, head
+    ref = head[5:]
+    loose = common_dir / ref
+    if loose.is_file():
+        return head, loose.read_text().strip()
+    packed = common_dir / 'packed-refs'
+    if packed.is_file():
+        for line in packed.read_text().splitlines():
+            if line and not line.startswith(('#', '^')):
+                commit, name = line.split(' ', 1)
+                if name == ref:
+                    return head, commit
+    raise RuntimeError('cannot resolve owned worktree HEAD without spawning a process')
+
+
+def resource_snapshot():
+    relative = Path('/proc/self/cgroup').read_text().strip().split('::', 1)[1]
+    directory = Path('/sys/fs/cgroup') / relative.lstrip('/')
+    return {name: (directory / name).read_text().strip()
+            for name in ['pids.current', 'pids.max', 'pids.peak', 'pids.events',
+                         'memory.current', 'memory.peak', 'memory.events']
+            if (directory / name).is_file()}
+
+
+def stop(process):
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    # The group may still contain grandchildren after its leader exits.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def port_available(port):
+    with socket.socket() as sock:
+        try:
+            sock.bind(('127.0.0.1', port))
+            return True
+        except OSError:
+            return False
+
+
+def owned_listener(port, leader):
+    output = subprocess.check_output(['ss', '-H', '-lptn', f'sport = :{port}'], text=True)
+    if not output.strip():
+        return False
+    expected = Path('/proc/self/cgroup').read_text()
+    for row in output.splitlines():
+        if f'127.0.0.1:{port}' not in row:
+            raise RuntimeError('listener is not restricted to the selected loopback origin')
+        pids = re.findall(r'pid=(\d+)', row)
+        if not pids:
+            raise RuntimeError('cannot prove listener ownership')
+        for value in pids:
+            pid = int(value)
+            if Path(f'/proc/{pid}/cgroup').read_text() != expected:
+                raise RuntimeError('port belongs to a foreign cgroup')
+            seen = set()
+            while pid != leader and pid > 1 and pid not in seen:
+                seen.add(pid)
+                pid = int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[1])
+            if pid != leader:
+                raise RuntimeError('port is not owned by the launched server tree')
+    return True
+
+
+def interrupted(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--seconds', type=int, default=480)
+    p.add_argument('--port', type=int, default=3000)
+    p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--capture', action='store_true', help='one-shot unauthenticated entry-page screenshot and DOM; not protected-screen verification')
+    p.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
+    args = p.parse_args()
+    if not 30 <= args.seconds <= 540 or not 1 <= args.port <= 65535:
+        p.error('seconds must be 30..540; port must be 1..65535')
+    root = Path(git('rev-parse', '--show-toplevel')).resolve()
+    os.chdir(root)
+    command = [sys.executable, str(Path(__file__).resolve()), '--inside', '--seconds', str(args.seconds), '--port', str(args.port)]
+    if args.capture:
+        command.append('--capture')
+    if args.dry_run:
+        subprocess.run([str(ENVIRONMENT), '--profile', 'admin-ui'], check=True)
+        subprocess.run([str(GUARD), '--dry-run', '--', *command], check=True)
+        return
+    if not args.inside:
+        os.execv(str(GUARD), [str(GUARD), '--', *command])
+    if 'omp-heavy-job.scope' not in Path('/proc/self/cgroup').read_text():
+        raise RuntimeError('internal entry requires the guarded scope')
+    status = json.loads(subprocess.check_output([str(ENVIRONMENT), '--profile', 'admin-ui'], text=True))
+    if status['dependencies'] != 'ready' or status['generated'] != 'ready':
+        raise RuntimeError('environment not ready: ' + json.dumps(status, ensure_ascii=False))
+    chromium = shutil.which('chromium')
+    if not chromium or not shutil.which('dbus-run-session'):
+        raise RuntimeError('installed Chromium and private dbus-run-session required; no automatic install')
+    if subprocess.run(['git', 'check-ignore', '-q', '.superpowers/assets/probe']).returncode:
+        raise RuntimeError('.superpowers must be locally ignored')
+    branch = git('branch', '--show-current')
+    revision = git('rev-parse', 'HEAD')
+    git_dir = Path(git('rev-parse', '--absolute-git-dir'))
+    common_dir = Path(git('rev-parse', '--git-common-dir')).resolve()
+    initial_head = head_identity(git_dir, common_dir)
+    if initial_head != ('ref: refs/heads/' + branch, revision):
+        raise RuntimeError('worktree identity changed during initialization')
+    if not git('rev-parse', '--git-common-dir') or (root / '.git').is_dir():
+        raise RuntimeError('use an explicitly owned linked worktree, not the root checkout')
+    port = args.port
+    if not port_available(port):
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+    deadline = time.monotonic() + args.seconds
+    server = browser = None
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    with tempfile.TemporaryDirectory(prefix='omp-ui-') as temporary:
+        tmp = Path(temporary)
+        tmp.chmod(0o700)
+        dirs = {name: tmp / name for name in ['home', 'config', 'data', 'state', 'cache', 'runtime', 'browser']}
+        for directory in dirs.values():
+            directory.mkdir(mode=0o700)
+        bus_config = tmp / 'bus.conf'
+        bus_config.write_text('<busconfig><type>session</type><listen>unix:tmpdir=' +
+                              str(dirs['runtime']) + '</listen><auth>EXTERNAL</auth>' +
+                              '<policy context="default"><allow user="' + str(os.getuid()) +
+                              '"/><allow own="*"/><allow send_destination="*"/>' +
+                              '<allow receive_sender="*"/></policy></busconfig>')
+        # No service directories or included host policy: no portal/autostart
+        # activation and no forwarding to the owner's session manager.
+        bus = ['dbus-run-session', '--config-file=' + str(bus_config), '--']
+        environment = {k: v for k, v in os.environ.items() if k not in {'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS', 'DBUS_STARTER_ADDRESS', 'DBUS_STARTER_BUS_TYPE', 'DBUS_SYSTEM_BUS_ADDRESS', 'AT_SPI_BUS_ADDRESS', 'HYPRLAND_INSTANCE_SIGNATURE'}}
+        environment.update(HOME=str(dirs['home']), XDG_CONFIG_HOME=str(dirs['config']), XDG_DATA_HOME=str(dirs['data']), XDG_STATE_HOME=str(dirs['state']), XDG_CACHE_HOME=str(dirs['cache']), XDG_RUNTIME_DIR=str(dirs['runtime']))
+        artifacts = root / '.superpowers/assets' / tmp.name
+        artifacts.mkdir(parents=True, mode=0o700)
+        stop_file = artifacts / 'stop'
+        # Backend CORS admits localhost, not the numerically equivalent 127.0.0.1.
+        # Listener ownership is still proved against its actual 127.0.0.1 socket.
+        url = f'http://localhost:{port}'
+        manifest = {'root': str(root), 'branch': branch, 'head': revision, 'app': 'payscrow-admin', 'repository': status['repository'],
+                    'source_diff_sha256': hashlib.sha256(subprocess.check_output(['git', 'diff', 'HEAD'])).hexdigest(),
+                    'url': url, 'stop_file': str(stop_file), 'artifacts': str(artifacts), 'deadline_seconds': args.seconds,
+                    'verification': 'not exercised; launcher readiness is not screen verification'}
+        try:
+            with (artifacts / 'server.log').open('w') as server_log, (artifacts / 'browser.log').open('w') as browser_log:
+                server = subprocess.Popen([*bus, 'npm', 'run', 'dev', '-w', 'payscrow-admin', '--', '--host', '127.0.0.1', '--port', str(port)], env=environment, stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
+                while True:
+                    if server.poll() is not None:
+                        raise RuntimeError(f'owned server exited ({server.returncode}); inspect server.log; no automatic retry')
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError('server readiness deadline exceeded; no automatic retry')
+                    if not owned_listener(port, server.pid):
+                        time.sleep(0.2)
+                        continue
+                    try:
+                        with urllib.request.urlopen(url, timeout=1) as response:
+                            if response.status == 200 and owned_listener(port, server.pid):
+                                break
+                    except OSError:
+                        time.sleep(0.2)
+                if args.capture:
+                    capture = [*bus, chromium, '--headless=new',
+                               '--user-data-dir=' + str(dirs['browser']), '--no-first-run',
+                               '--no-default-browser-check', '--disable-background-networking',
+                               '--disable-sync', '--disable-extensions', '--password-store=basic',
+                               '--window-size=1280,960', '--screenshot=' + str(artifacts / 'entry.png'),
+                               '--dump-dom', '--virtual-time-budget=5000', '--timeout=90000', url]
+                    with (artifacts / 'entry-dom.html').open('w') as dom:
+                        browser = subprocess.Popen(capture, env=environment, stdout=dom,
+                                                   stderr=browser_log, start_new_session=True)
+                        manifest.update(server_pid=server.pid, browser_pid=browser.pid,
+                                        cgroup=Path('/proc/self/cgroup').read_text().strip())
+                        result = browser.wait(timeout=max(1, min(120, deadline - time.monotonic())))
+                    if result or not (artifacts / 'entry.png').is_file():
+                        raise RuntimeError(f'entry-page capture failed ({result}); no automatic retry')
+                    manifest['verification'] = 'entry page captured only; inspect image and DOM; protected screen remains unverified'
+                    print(json.dumps(manifest, ensure_ascii=False), flush=True)
+                    return
+                browser = subprocess.Popen([*bus, chromium, '--headless=new', '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--user-data-dir=' + str(dirs['browser']), '--no-first-run', '--no-default-browser-check', '--disable-background-networking', '--disable-sync', '--disable-extensions', '--password-store=basic', url], env=environment, stdout=browser_log, stderr=subprocess.STDOUT, start_new_session=True)
+                endpoint = dirs['browser'] / 'DevToolsActivePort'
+                while not endpoint.exists():
+                    if browser.poll() is not None or server.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError('owned browser/server not ready; no automatic retry')
+                    time.sleep(0.1)
+                cdp_port, websocket = endpoint.read_text().splitlines()[:2]
+                manifest.update(server_pid=server.pid, browser_pid=browser.pid, cdp_url=f'http://127.0.0.1:{cdp_port}', cdp_websocket=f'ws://127.0.0.1:{cdp_port}{websocket}', cgroup=Path('/proc/self/cgroup').read_text().strip())
+                (artifacts / 'session.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
+                print(json.dumps(manifest, ensure_ascii=False), flush=True)
+                print('Attach ONLY this cdp_url; write the stop_file to finish. No personal cookies, auth bypass or financial writes.', flush=True)
+                while not stop_file.exists() and time.monotonic() < deadline:
+                    if browser.poll() is not None or server.poll() is not None:
+                        raise RuntimeError('owned browser/server exited during check')
+                    if head_identity(git_dir, common_dir) != initial_head:
+                        raise RuntimeError('worktree identity changed during UI check')
+                    time.sleep(0.2)
+                if not stop_file.exists():
+                    raise RuntimeError('UI session deadline reached; do not automatically retry')
+        finally:
+            try:
+                manifest['resources'] = resource_snapshot()
+            except (OSError, ValueError) as error:
+                manifest['resources_unavailable'] = str(error)
+            stop(browser)
+            stop(server)
+            manifest['closed'] = True
+            (artifacts / 'session.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print('ui-session: refusing: ' + str(error), file=sys.stderr)
+        raise SystemExit(1)

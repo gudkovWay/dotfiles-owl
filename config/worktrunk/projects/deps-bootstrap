@@ -1,0 +1,5 @@
+#!/bin/sh
+# Explicit lockfile materialization. Never a worktree creation hook.
+# All native install scripts and root Husky are audited by project-environment;
+# workspace-wide Nuxt postinstall is suppressed. Prepare is a separate action.
+exec /home/q/.config/worktrunk/projects/project-environment --install "$@"

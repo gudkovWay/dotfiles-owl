@@ -1,0 +1,54 @@
+#!/bin/sh
+# Pre-start hook: write NUXT_PUBLIC_API_BASE into each Payscrow LK app .env.
+# Usage: pre-start-env <branch>
+#
+# Frontend-only work uses shared dev. A confirmed backend deployment can be
+# selected explicitly with WT_P2P_API_BASE; never infer it from a frontend branch.
+#
+# Only the Payscrow LK apps (admin, merchant, provider) get the backend override.
+# payscrow-form is not one of them: it consumes a different form-gateway
+# env contract (NUXT_PUBLIC_API_URL/WS_URL/REDIRECT_URL), not NUXT_PUBLIC_API_BASE.
+# Lucky apps are checked on the shared dev stand after merge, only when
+# requested; OCK is retired.
+#
+# Only apps whose tracked source is present in this worktree get a
+# .env. Branches created before an app landed (or after one was removed) must
+# not fail here, and no directory is ever created just to hold a .env.
+#
+# Idempotent: exactly one NUXT_PUBLIC_API_BASE line per .env, other lines kept.
+set -eu
+
+branch=${1:?usage: pre-start-env <branch>}
+
+api_base=${WT_P2P_API_BASE:-https://api.dev.payscrow-cascade.io}
+case "$api_base" in
+	https://api*.dev.payscrow-cascade.io) ;;
+	*) echo "pre-start-env: unsupported backend origin" >&2; exit 2 ;;
+esac
+# The wildcard above selects a stand name, not arbitrary URL components.
+# Reject credentials, paths, queries, whitespace and env-line injection.
+host=${api_base#https://}
+case "$host" in
+	*[!A-Za-z0-9.-]*) echo "pre-start-env: backend must be a bare HTTPS origin" >&2; exit 2 ;;
+esac
+
+root=$(git rev-parse --show-toplevel)
+
+written=0
+for app in payscrow-admin payscrow-merchant payscrow-provider; do
+	# Removed on some branches: a stale ignored .nuxt/.output dir can outlive
+	# the app, so test for tracked config, not for the directory.
+	[ -f "$root/apps/$app/nuxt.config.ts" ] || continue
+	env_file="$root/apps/$app/.env"
+	tmp="$env_file.tmp.$$"
+	: >"$tmp"
+	if [ -f "$env_file" ]; then
+		# grep exits 1 when it filters everything out; that is fine.
+		grep -v '^NUXT_PUBLIC_API_BASE=' "$env_file" >"$tmp" || :
+	fi
+	printf 'NUXT_PUBLIC_API_BASE=%s\n' "$api_base" >>"$tmp"
+	mv "$tmp" "$env_file"
+	written=$((written + 1))
+done
+
+echo "pre-start-env: NUXT_PUBLIC_API_BASE=$api_base written to $written Payscrow LK apps"

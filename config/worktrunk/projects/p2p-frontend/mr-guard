@@ -1,0 +1,55 @@
+#!/bin/sh
+# MR guard: block apiBase changes relative to the base, verify remaining
+# apiBase assignments still point at the shared dev stand, and allow any
+# unrelated nuxt.config.ts changes.
+#
+# Base is configurable: WT_MR_BASE (default origin/dev).
+# Exit 0 = safe, exit 1 = blocked.
+set -eu
+
+base=${WT_MR_BASE:-origin/dev}
+# An apiBase assignment line: only indentation, then the (optionally quoted)
+# key. Comment lines containing the key never match.
+api_base_ere="^[[:space:]]*[\"']?apiBase[\"']?[[:space:]]*:"
+# A line passes the current-tree check only when the whole line is exactly
+# an (optionally quoted) apiBase assignment of the shared dev stand, with an
+# optional trailing comma, optional // comment, and surrounding whitespace.
+allowed_line_ere="^[[:space:]]*[\"']?apiBase[\"']?[[:space:]]*:[[:space:]]*'https://api\.dev\.payscrow-cascade\.io',?[[:space:]]*(//.*)?$"
+
+fail() {
+	echo "mr-guard: FAIL: $*" >&2
+	exit 1
+}
+
+git rev-parse --verify --quiet "$base" >/dev/null ||
+	fail "base '$base' not found"
+
+# 1. No added or removed apiBase assignments vs base (commits + working tree).
+added_or_removed=$(
+	git diff "$base" -- 'apps/*/nuxt.config.ts' |
+		grep -E "^[+-][[:space:]]*[\"']?apiBase[\"']?[[:space:]]*:" || :
+)
+[ -z "$added_or_removed" ] ||
+	fail "apiBase assignments must not change vs $base:
+$added_or_removed"
+
+# Untracked nuxt.config.ts files count as additions.
+for f in $(git ls-files --others --exclude-standard -- 'apps/*/nuxt.config.ts'); do
+	grep -qE "$api_base_ere" "$f" &&
+		fail "apiBase assignment in untracked $f"
+done
+
+# 2. Every current tracked apiBase assignment uses exactly the dev stand.
+# Files without any apiBase (e.g. form apps) pass; zero matches is fine.
+for f in $(git ls-files -- 'apps/*/nuxt.config.ts'); do
+	matches=$(grep -E "$api_base_ere" "$f" || :)
+	[ -n "$matches" ] || continue
+	while IFS= read -r line; do
+		printf '%s\n' "$line" | grep -qE "$allowed_line_ere" ||
+			fail "non-dev apiBase in $f: $line"
+	done <<EOF
+$matches
+EOF
+done
+
+echo "mr-guard: OK (base $base)"

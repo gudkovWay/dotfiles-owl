@@ -1,0 +1,39 @@
+#!/bin/sh
+# Dev-server launcher, run under `wt step tether` so the process group dies
+# with the worktree.
+# Usage: dev-server <port> --app=<workspace> [--dry-run]
+set -eu
+
+port=${1:?usage: dev-server <port> --app=<workspace>}
+shift || :
+
+app=
+dry_run=
+for arg in "$@"; do
+	case $arg in
+	--app=*) app=${arg#--app=} ;;
+	--dry-run) dry_run=--dry-run ;;
+	*) echo "dev-server: unexpected argument: $arg" >&2; exit 2 ;;
+	esac
+done
+[ -n "$app" ] || {
+	echo "dev-server: missing --app=<workspace>" >&2
+	exit 2
+}
+
+case "$app" in
+	*[!a-zA-Z0-9_-]*|'') echo "dev-server: invalid workspace name" >&2; exit 2 ;;
+esac
+case "$port" in
+	*[!0-9]*|'') echo "dev-server: invalid port" >&2; exit 2 ;;
+esac
+[ "$port" -ge 1 ] && [ "$port" -le 65535 ] || exit 2
+root=$(git rev-parse --show-toplevel)
+[ -d "$root/apps/$app" ] || {
+	echo "dev-server: unknown app: $app" >&2
+	exit 2
+}
+
+cd "$root"
+exec /home/q/.config/worktrunk/projects/guarded-run ${dry_run:+$dry_run} -- \
+	npm run dev -w "$app" -- --host 127.0.0.1 --port "$port"

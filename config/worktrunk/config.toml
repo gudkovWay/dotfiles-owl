@@ -1,0 +1,33 @@
+# Permanent worktrees live under one repository-independent authority.
+worktree-path = "{{ repo_path }}/../.worktrees/{{ repo }}/{{ branch }}"
+
+[projects."gitlab.psclp.org/common/frontend/frontend"]
+
+# Write only the Payscrow LK backend override; frontend branch is not a backend deployment.
+[projects."gitlab.psclp.org/common/frontend/frontend".pre-start]
+env = "/home/q/.config/worktrunk/projects/p2p-frontend/pre-start-env {{ branch }}"
+
+[projects."gitlab.psclp.org/common/frontend/frontend".aliases]
+# GitLab MR with apiBase guard; GitLab only — never `wt merge` for p2p.
+mr = "/home/q/.config/worktrunk/projects/p2p-frontend/mr {{ args }}"
+
+# Finite capped dev server; still tethered to this worktree.
+dev = "wt step tether -- sh /home/q/.config/worktrunk/projects/p2p-frontend/dev-server {{ branch | hash_port }} {{ args }}"
+
+# `wt deps` — explicit on-demand `npm ci`; editing a worktree never needs it,
+# so it is not a hook and never gates worktree creation.
+deps = "sh /home/q/.config/worktrunk/projects/deps-bootstrap {{ args }}"
+env = "/home/q/.config/worktrunk/projects/project-environment {{ args }}"
+ui = "/home/q/.config/worktrunk/projects/ui-session {{ args }}"
+
+# Ecom is a separate project (own remote identity, own app set, own stand).
+# It deliberately has no cascade .env pre-start hook: p2p's NUXT_PUBLIC_API_BASE
+# rewriting is p2p-only and must not leak here.
+[projects."gitlab.psclp.org/ecom/frontend/frontend"]
+
+[projects."gitlab.psclp.org/ecom/frontend/frontend".aliases]
+# Same on-demand action and name as p2p; still never runs on worktree creation.
+deps = "sh /home/q/.config/worktrunk/projects/deps-bootstrap {{ args }}"
+env = "/home/q/.config/worktrunk/projects/project-environment {{ args }}"
+dev = "wt step tether -- sh /home/q/.config/worktrunk/projects/p2p-frontend/dev-server {{ branch | hash_port }} {{ args }}"
+ui = "/home/q/.config/worktrunk/projects/ui-session {{ args }}"

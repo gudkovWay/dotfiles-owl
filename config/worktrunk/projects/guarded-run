@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""One host slot and one bounded cgroup for native commands. No retries."""
+import argparse
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+LOCK = '/run/user/1000/omp-heavy-jobs.lock'
+PROPERTIES = ('CPUQuota=200%', 'CPUWeight=20', 'MemoryHigh=4G', 'MemoryMax=6G',
+              'MemorySwapMax=0', 'TasksMax=256', 'IOWeight=20',
+              'RuntimeMaxSec=10min', 'OOMPolicy=kill')
+HEAVY = {'vitest', 'playwright', 'jest', 'pytest', 'vue-tsc', 'nuxt', 'nuxi',
+         'esbuild', 'tsc', 'cargo', 'vite', 'rollup'}
+HEAP_RE = re.compile(r'--max[-_]old[-_]space[-_]size(?:=|\s+)(\d+)')
+
+
+def refuse(message, code=1):
+    print('guarded-run: refusing: ' + message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def node_options(value):
+    limits = [int(x) for x in HEAP_RE.findall(value)]
+    # Preserve Node's own quoting; POSIX shlex.join would introduce single quotes
+    # that NODE_OPTIONS does not interpret as shell quoting.
+    remainder = HEAP_RE.sub('', value).strip()
+    shlex.split(remainder)  # Reject malformed quoting before launching anything.
+    return (remainder + ' ' if remainder else '') + f'--max-old-space-size={min([2048] + limits)}'
+
+
+def scope_command(command, options):
+    return ['systemd-run', '--user', '--scope', '--unit=omp-heavy-job', '--collect',
+            '--expand-environment=no', *[item for p in PROPERTIES for item in ('-p', p)],
+            '--', 'nice', '-n', '10', 'env', 'NODE_OPTIONS=' + options, *command]
+
+
+def ancestors():
+    result = set()
+    pid = os.getpid()
+    while pid > 1 and pid not in result:
+        result.add(pid)
+        try:
+            pid = int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return result
+
+
+def heavy_processes():
+    own = ancestors()
+    found = []
+    for path in Path('/proc').glob('[0-9]*/cmdline'):
+        pid = int(path.parent.name)
+        if pid in own:
+            continue
+        try:
+            args = path.read_bytes().decode(errors='replace').strip('\0').split('\0')
+        except OSError:
+            continue
+        if not args or not args[0]:
+            continue
+        # Executables / node script tokens only, not grep patterns or shell prose.
+        words = [Path(a).name.removesuffix('.js').removesuffix('.mjs').removesuffix('.cjs')
+                 for a in args[:3] if not a.startswith('-') and not any(c.isspace() for c in a)]
+        package_install = any(Path(a).name in {'npm', 'npm-cli.js', 'pnpm', 'yarn', 'bun'}
+                              for a in args[:3]) and any(a in {'install', 'ci'} for a in args[1:])
+        go_test = Path(args[0]).name == 'go' and 'test' in args[1:]
+        native_tests = Path(args[0]).name in {'node', 'bun'} and any(
+            a == '--test' or a.startswith('--test=') or a == 'test' for a in args[1:3])
+        package_run = any(Path(a).name in {'npm', 'npm-cli.js', 'pnpm', 'yarn', 'bun'}
+                          for a in args[:3]) and any(
+            a.split(':', 1)[0] in {'test', 'build', 'prepare', 'dev', 'typecheck'}
+            for a in args[1:5])
+        if HEAVY.intersection(words) or package_install or package_run or native_tests or go_test:
+            found.append(f'{pid}: ' + shlex.join(args)[:500])
+    return found
+
+
+def preflight():
+    subprocess.run(['free', '-h'], check=True)
+    memory = Path('/proc/meminfo').read_text()
+    print(memory, end='')
+    subprocess.run(['nproc'], check=True)
+    # Required broad discovery; classification below rejects real jobs, not tsserver paths.
+    subprocess.run(['pgrep', '-af', 'vitest|playwright|jest|pytest|vue-tsc|nuxt|nuxi|vite|rollup|esbuild|tsc|cargo|go test|node.*--test|npm.*(install|ci)|pnpm.*install|yarn.*install|bun.*(install|test)'], check=False)
+    subprocess.run(['systemctl', '--user', 'list-units', '--all', 'omp-heavy-job.scope'], check=True)
+    available = int(re.search(r'^MemAvailable:\s+(\d+)', memory, re.M).group(1))
+    if available < 10485760:
+        refuse(f'MemAvailable={available} KiB; need 10485760 KiB')
+    controllers = Path('/sys/fs/cgroup/cgroup.controllers').read_text().split()
+    if not {'cpu', 'memory', 'pids'}.issubset(controllers):
+        refuse('cgroup v2 cpu/memory/pids controllers unavailable')
+    bus = subprocess.run(['systemctl', '--user', 'show-environment'], capture_output=True)
+    if bus.returncode:
+        refuse('user systemd bus unavailable')
+    state = subprocess.run(['systemctl', '--user', 'show', 'omp-heavy-job.scope',
+                            '--property=ActiveState', '--value'], capture_output=True, text=True)
+    if state.returncode:
+        refuse('cannot inspect the resource scope')
+    if state.stdout.strip() in {'active', 'activating', 'deactivating', 'reloading'}:
+        refuse('omp-heavy-job.scope still active', 75)
+    conflicts = heavy_processes()
+    if conflicts:
+        refuse('another heavy workload exists:\n' + '\n'.join(conflicts), 75)
+
+
+def caps_probe():
+    output = subprocess.check_output(
+        ['systemctl', '--user', 'show', 'omp-heavy-job.scope',
+         '--property=ControlGroup,CPUWeight,IOWeight,RuntimeMaxUSec,OOMPolicy'], text=True)
+    properties = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+    root = Path('/sys/fs/cgroup') / properties['ControlGroup'].lstrip('/')
+    for name, expected in {'memory.high': 4294967296, 'memory.max': 6442450944,
+                           'memory.swap.max': 0, 'pids.max': 256}.items():
+        if root.joinpath(name).read_text().strip() != str(expected):
+            refuse(f'{name} cap not applied')
+    quota, period = root.joinpath('cpu.max').read_text().split()
+    if quota == 'max' or int(quota) != 2 * int(period):
+        refuse('CPUQuota cap not applied')
+    if properties.get('CPUWeight') != '20' or properties.get('IOWeight') != '20':
+        refuse('CPU/IO priority not applied')
+    if properties.get('RuntimeMaxUSec') not in {'10min', '600000000'} or properties.get('OOMPolicy') != 'kill':
+        refuse('runtime/OOM policy not applied')
+    print('guarded-run: cgroup caps verified')
+
+
+def wait_scope():
+    # Observe manager teardown while retaining the lock; never rerun the workload.
+    deadline = time.monotonic() + 2
+    while True:
+        state = subprocess.run(['systemctl', '--user', 'show', 'omp-heavy-job.scope',
+                                '--property=ActiveState', '--value'], capture_output=True, text=True)
+        if state.returncode:
+            refuse('cannot verify owned scope teardown')
+        if state.stdout.strip() not in {'active', 'activating', 'deactivating', 'reloading'}:
+            return
+        if time.monotonic() >= deadline:
+            refuse('owned scope has not stopped; do not start another workload')
+        time.sleep(0.05)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--wait', type=int, default=0, choices=range(0, 61), metavar='0..60')
+    parser.add_argument('--locked', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--probe', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.probe:
+        caps_probe()
+        return
+    command = args.command[1:] if args.command[:1] == ['--'] else args.command
+    if not command:
+        parser.error('a native command is required after --')
+    for token in command:
+        if any(int(n) > 2048 for n in HEAP_RE.findall(token)):
+            refuse('command explicitly raises Node heap above 2048 MiB')
+    options = node_options(os.environ.get('NODE_OPTIONS', ''))
+    native = scope_command(command, options)
+    lock_options = ['--timeout', str(args.wait)] if args.wait else ['--nonblock']
+    if args.dry_run:
+        print(shlex.join(['flock', '--exclusive', *lock_options, '--conflict-exit-code', '75', LOCK, *native]))
+        return
+    if not args.locked:
+        os.execvp('flock', ['flock', '--exclusive', *lock_options, '--conflict-exit-code', '75', LOCK,
+                           sys.executable, str(Path(__file__).resolve()), '--locked', '--', *command])
+    if Path(f'/proc/{os.getppid()}/comm').read_text().strip() != 'flock':
+        refuse('internal locked entry requires the owning flock process')
+    preflight()  # AFTER atomic lock acquisition; includes fresh memory measurement.
+    probe = scope_command([sys.executable, str(Path(__file__).resolve()), '--probe'], options)
+    checked = subprocess.run(probe)
+    if checked.returncode:
+        refuse('cgroup control-plane verification failed')
+    wait_scope()
+    result = subprocess.run(native)
+    wait_scope()
+    raise SystemExit(result.returncode)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        refuse(str(exc))

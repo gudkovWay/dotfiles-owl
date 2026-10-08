@@ -1,0 +1,10 @@
+#!/bin/sh
+# MR wrapper: run the apiBase guard, then delegate to glab mr.
+# Usage: mr <glab mr arguments...>
+set -eu
+
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+"$dir/mr-guard"
+
+exec "${GLAB_BIN:-glab}" mr "$@"
