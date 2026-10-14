@@ -71,6 +71,10 @@ link local/share/icons/Dot-Dark "$HOME/.icons/Dot-Dark"
 link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
 link omp/extensions/prompt-card "$HOME/.omp/agent/extensions/prompt-card"
 link omp/extensions/image-links.ts "$HOME/.omp/agent/extensions/image-links.ts"
+# Источник апрува — только установленная root-owned копия, не editable checkout.
+# До её явной установки эти ссылки пропускаются; парольный диалог здесь не открываем.
+link omp/extensions/owner-approval.js "$HOME/.omp/agent/extensions/owner-approval.js"
+link omp/rules/owner-rule-authority.md "$HOME/.omp/agent/rules/owner-rule-authority.md"
 
 $DRY && exit 0
 
@@ -86,6 +90,11 @@ cat <<EOF
 Демон пробуждения ставится своим скриптом (заводит пользователя screenwake):
 
   sudo $REPO/config/hypr/scripts/wake-on-space-daemon/install.sh
+
+Канал подтверждённых исключений OMP (отдельный системный парольный диалог):
+
+  python3 "$REPO/omp/owner-approval/setup.py"
+  bash "$REPO/install.sh"
 
 Включить пользовательские юниты:
 
