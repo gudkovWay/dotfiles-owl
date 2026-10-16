@@ -20,6 +20,7 @@ require("lazy").setup({
 require("config.options")
 require("config.keymaps")
 require("config.autocmds")
+require("config.autoreload").setup()
 
 -- harness: маркер, что init.lua дошёл до конца; бенчмарк проверяет его
 -- (headless nvim молчит при ошибке в init и всё равно выходит с кодом 0)
