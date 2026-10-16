@@ -28,6 +28,11 @@ cat >"$STUB_BIN/systemctl" <<'EOF'
 exit 0
 EOF
 chmod +x "$STUB_BIN/systemctl"
+cat >"$STUB_BIN/herdr" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$STUB_BIN/herdr"
 
 # An untracked runtime file a fish session may have created inside config/fish.
 RUNTIME_FILE="$FAKE_CONFIG/fish/fish_read_history"
@@ -73,6 +78,13 @@ for entry in \
   [[ -L "$destination" && "$(readlink -f "$destination")" == "$REPO/$source" ]] ||
     fail "authored workflow file is not installed: $source"
 done
+
+# The image opener must be installed outside any transient build/worktree.
+OPENER="$FAKE_HOME/.local/share/omp/herdr-local-files"
+[[ -L "$OPENER" && "$(readlink -f "$OPENER")" == "$REPO/omp/herdr-local-files" ]] ||
+  fail 'image opener is not installed from the dotfiles repository'
+[[ -f "$OPENER/open-file.ts" && -f "$OPENER/herdr-plugin.toml" && -f "$OPENER/kitty.conf" ]] ||
+  fail 'installed image opener is incomplete'
 
 # A subsequent install must keep a real owner-edited skill, not relink it.
 OWNER_SKILL="$FAKE_HOME/.agents/skills/starting-worktree-work/SKILL.md"

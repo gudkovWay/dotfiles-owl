@@ -66,6 +66,7 @@ link claude/hooks         "$HOME/.claude/hooks"
 # receipts, provider config и секреты ~/.omp остаются локальными.
 link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
 link omp/extensions/jev-shadow.ts "$HOME/.omp/agent/extensions/jev-shadow.ts"
+link omp/herdr-local-files "$HOME/.local/share/omp/herdr-local-files"
 while IFS= read -r -d '' f; do
   link "$f" "$HOME/.omp/agent/${f#omp/}"
 done < <(git -C "$REPO" ls-files -z -- omp/hooks omp/rules omp/skills omp/jev)
@@ -74,6 +75,11 @@ while IFS= read -r -d '' f; do
 done < <(git -C "$REPO" ls-files -z -- agents/skills)
 
 $DRY && exit 0
+
+# Register only the integration just linked, without restarting Herdr or OMP.
+if [[ -L "$HOME/.local/share/omp/herdr-local-files" ]] && command -v herdr >/dev/null 2>&1; then
+  herdr plugin link "$HOME/.local/share/omp/herdr-local-files" --enabled
+fi
 
 systemctl --user daemon-reload
 cat <<EOF
