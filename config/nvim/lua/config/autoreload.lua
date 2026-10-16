@@ -32,14 +32,37 @@ local function detach(buf)
   end
 end
 
+local highlight
+local function reread(buf)
+  if vim.bo[buf].modified and vim.fn.confirm(
+    "Файл изменён снаружи. Перечитать и отбросить несохранённые правки?",
+    "&Перечитать\n&Оставить", 2
+  ) ~= 1 then return end
+  local old = api.nvim_buf_get_lines(buf, 0, -1, false)
+  local ok, err = pcall(api.nvim_buf_call, buf, function()
+    local view = vim.fn.winsaveview()
+    vim.cmd({ cmd = "edit", bang = true, mods = { silent = true, keepalt = true, keepjumps = true } })
+    vim.fn.winrestview(view)
+  end)
+  if ok then highlight(buf, old) else vim.notify("reload: " .. err, vim.log.levels.WARN) end
+end
+
 local function flush()
   if not active or checking or api.nvim_get_mode().mode ~= "n" or vim.fn.getcmdwintype() ~= "" then return end
   checking = true
-  for buf in pairs(pending) do
+  for buf, from_fs in pairs(pending) do
     pending[buf] = nil
-    if buffers[buf] and api.nvim_buf_is_loaded(buf) then
+    local state = buffers[buf]
+    if state and api.nvim_buf_is_loaded(buf) then
+      local checked = state.checked
       local ok, err = pcall(vim.cmd.checktime, buf)
-      if not ok then vim.notify("checktime: " .. err, vim.log.levels.WARN) end
+      if not ok then
+        vim.notify("checktime: " .. err, vim.log.levels.WARN)
+      elseif from_fs and buffers[buf] == state and state.checked == checked then
+        -- checktime compares timestamps/mode, not inode/size: real writes can share an mtime.
+        local stat = uv.fs_stat(state.name)
+        if stat and stat.type == "file" then reread(buf) end
+      end
     end
   end
   checking = false
@@ -56,7 +79,7 @@ local function track(buf)
   local state = buffers[buf]
   if state and state.name == name then return end
   detach(buf)
-  state = { name = name, dir = parent, autoread = vim.bo[buf].autoread, generation = 0 }
+  state = { name = name, dir = parent, autoread = vim.bo[buf].autoread, generation = 0, checked = 0 }
   buffers[buf] = state
   -- autoread would bypass FileChangedShell for clean buffers, losing the pre-reload text.
   vim.bo[buf].autoread = false
@@ -82,7 +105,7 @@ local function track(buf)
   dir.buffers[buf] = true
 end
 
-local function highlight(buf, old)
+highlight = function(buf, old)
   local state = buffers[buf]
   if not state or not api.nvim_buf_is_loaded(buf) then return end
   local new = api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -149,7 +172,9 @@ function M.setup()
   api.nvim_create_autocmd({ "FocusGained", "BufEnter" }, {
     group = group,
     callback = function()
-      for buf in pairs(buffers) do pending[buf] = true end
+      for buf in pairs(buffers) do
+        if pending[buf] == nil then pending[buf] = false end -- Focus checks are not filesystem writes.
+      end
       vim.schedule(flush)
     end,
   })
@@ -160,6 +185,7 @@ function M.setup()
     group = group,
     callback = function(a)
       if not buffers[a.buf] then return end
+      buffers[a.buf].checked = buffers[a.buf].checked + 1
       before[a.buf] = nil
       if vim.bo[a.buf].modified or vim.v.fcs_reason == "deleted" then
         vim.v.fcs_choice = "ask"

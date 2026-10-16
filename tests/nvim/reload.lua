@@ -7,11 +7,18 @@ local notices, choices = {}, {}
 vim.notify = function(message) notices[#notices + 1] = message end
 
 local function wait_for(test, message, timeout)
-  assert(vim.wait(timeout or 3000, test, 20), message)
+  if not vim.wait(timeout or 3000, test, 20) then
+    local stat = uv.fs_stat(path)
+    error(message .. ': ' .. vim.inspect({
+      mode = api.nvim_get_mode().mode, disk = stat and { size = stat.size, mtime = stat.mtime },
+      buffer = api.nvim_buf_get_lines(0, 0, -1, false), notices = notices,
+    }))
+  end
 end
-local function write(lines, atomic)
+local function write(lines, atomic, mtime)
   local dest = atomic and (path .. '.new') or path
   vim.fn.writefile(lines, dest)
+  if mtime then assert(uv.fs_utime(dest, mtime, mtime)) end
   if atomic then assert(uv.fs_rename(dest, path)) end
 end
 local function lines(buf) return api.nvim_buf_get_lines(buf, 0, -1, false) end
@@ -24,7 +31,9 @@ local function handles()
   return count
 end
 
-write({ 'before', 'second', 'third' })
+-- Equal timestamps occur with fast writes or tools preserving mtimes: inode/size must still count.
+local unchanged_mtime = os.time() - 60
+write({ 'before', 'second', 'third' }, false, unchanged_mtime)
 local baseline = handles()
 reload.setup()
 vim.cmd.edit(path)
@@ -39,15 +48,15 @@ api.nvim_create_autocmd('FileChangedShell', {
   end,
 })
 
-write({ 'agent edited this line', 'second', 'third' })
+write({ 'agent edited this line', 'second', 'third' }, false, unchanged_mtime)
 wait_for(function() return lines(buf)[1] == 'agent edited this line' end, 'external write was not reloaded')
 assert(not vim.bo[buf].modified, 'external reload dirtied buffer')
 assert(marks(buf)[1][2] == 0 and marks(buf)[1][4].line_hl_group, 'changed first line is not highlighted')
 assert(notices[#notices]:find('+1') and notices[#notices]:find('−1'), 'missing external diff notification')
 
-write({ 'atomic replacement one is longer', 'second', 'third' }, true)
+write({ 'atomic replacement one is longer', 'second', 'third' }, true, unchanged_mtime)
 wait_for(function() return lines(buf)[1] == 'atomic replacement one is longer' end, 'first atomic write missed')
-write({ 'atomic replacement two', 'second', 'third' }, true)
+write({ 'atomic replacement two', 'second', 'third' }, true, unchanged_mtime)
 wait_for(function() return lines(buf)[1] == 'atomic replacement two' end, 'watch detached after atomic rename')
 
 -- A shared directory watcher must survive closing one of its subscribed buffers.
@@ -76,8 +85,26 @@ assert(choices[#choices].choice == 'ask', 'dirty buffer did not ask before reloa
 assert(lines(buf)[1] == 'unsaved local work' and vim.bo[buf].modified, 'unsaved edits were overwritten')
 assert(vim.fn.readfile(path)[1] == 'different external version', 'reload wrote local edits to disk')
 
+-- Check the native confirmation boundary when timestamps cannot expose a conflict.
+assert(uv.fs_utime(path, unchanged_mtime, unchanged_mtime))
+vim.cmd.checktime(buf) -- Decline this ordinary timestamp conflict via the handler above.
+local confirm, confirmations = vim.fn.confirm, 0
+vim.fn.confirm = function()
+  confirmations = confirmations + 1
+  return 2 -- Keep unsaved edits.
+end
+write({ 'mtime-preserving external version', 'second', 'third' }, true, unchanged_mtime)
+wait_for(function() return confirmations > 0 end, 'same-timestamp conflict did not ask')
+assert(lines(buf)[1] == 'unsaved local work' and vim.bo[buf].modified, 'same-timestamp write overwrote unsaved edits')
+assert(vim.fn.readfile(path)[1] == 'mtime-preserving external version', 'declining reload changed disk')
+vim.fn.confirm = function() return 1 end -- Explicit user approval may discard the local version.
+write({ 'approved external version', 'second', 'third' }, true, unchanged_mtime)
+wait_for(function() return lines(buf)[1] == 'approved external version' end, 'approved conflict reload failed')
+assert(not vim.bo[buf].modified, 'approved reload left buffer dirty')
+vim.fn.confirm = confirm
+
 vim.cmd('edit!')
-write({ 'different external version' }, true)
+write({ 'approved external version' }, true)
 wait_for(function() return #lines(buf) == 1 end, 'pure line deletion not reloaded')
 local deletion = marks(buf)[1]
 assert(deletion and deletion[2] == 0 and deletion[4].sign_text and not deletion[4].line_hl_group,
