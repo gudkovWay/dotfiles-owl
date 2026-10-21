@@ -45,6 +45,14 @@ mkdir -p "$(dirname "$PRIVATE_POLICY")"
 printf '{"mode":"off"}\n' >"$PRIVATE_POLICY"
 chmod 600 "$PRIVATE_POLICY"
 
+PRIVATE_ACCOUNT="$FAKE_HOME/.secrets/payscrow-admin"
+mkdir -m 700 "$FAKE_HOME/.secrets"
+printf 'fixture-account\nfixture-password\n' >"$PRIVATE_ACCOUNT"
+chmod 600 "$PRIVATE_ACCOUNT"
+RUNTIME_CACHE="$FAKE_CONFIG/worktrunk/projects/__pycache__/local.pyc"
+mkdir -p "$(dirname "$RUNTIME_CACHE")"
+printf 'local cache marker\n' >"$RUNTIME_CACHE"
+
 env -i HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_CONFIG" PATH="$STUB_BIN:$PATH" \
   bash "$REPO/install.sh" >/dev/null 2>&1 ||
   fail 'installer exited non-zero (stderr not shown: could expose filesystem paths or secret material)'
@@ -78,6 +86,43 @@ for entry in \
   [[ -L "$destination" && "$(readlink -f "$destination")" == "$REPO/$source" ]] ||
     fail "authored workflow file is not installed: $source"
 done
+
+# Current aliases must restore their full Python/runtime dependency closure,
+# not just wrappers whose imports happen to exist on the developer's machine.
+for relative in \
+  config.toml projects/guarded-run projects/resource_guard.py \
+  projects/resource_policy.py projects/resource_executor.py \
+  projects/project-environment projects/dev_support.py projects/dev-session projects/ui-session \
+  projects/p2p-frontend/dev-server projects/p2p-frontend/commit projects/p2p-frontend/batch \
+  projects/p2p-frontend/push projects/p2p-frontend/stand projects/p2p-frontend/typecheck \
+  projects/p2p-frontend/mr projects/p2p-frontend/mr-guard projects/p2p-frontend/mr-command \
+  projects/p2p-frontend/feature-finalize projects/p2p-frontend/feature_finalize.py \
+  projects/p2p-frontend/merge_readiness.py projects/p2p-frontend/finalize-prompt.md; do
+  destination="$FAKE_CONFIG/worktrunk/$relative"
+  [[ -L "$destination" && "$(readlink -f "$destination")" == "$REPO/config/worktrunk/$relative" ]] ||
+    fail "workflow dependency is not installed: $relative"
+done
+for relative in \
+  projects/guarded-run projects/project-environment projects/dev-session projects/ui-session \
+  projects/p2p-frontend/dev-server projects/p2p-frontend/batch projects/p2p-frontend/feature-finalize; do
+  [[ -x "$FAKE_CONFIG/worktrunk/$relative" ]] ||
+    fail "workflow entrypoint is not executable: $relative"
+done
+for entrypoint in projects/dev-session projects/p2p-frontend/feature-finalize; do
+  env -i HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_CONFIG" PATH="$STUB_BIN:$PATH" \
+    python3 "$FAKE_CONFIG/worktrunk/$entrypoint" --help >/dev/null 2>&1 ||
+    fail "installed CLI cannot resolve its dependencies: $entrypoint"
+done
+[[ ! -L "$PRIVATE_ACCOUNT" && "$(cat "$PRIVATE_ACCOUNT")" == $'fixture-account\nfixture-password' ]] ||
+  fail 'local test credentials were replaced'
+[[ "$(stat -c %a "$PRIVATE_ACCOUNT")" == 600 ]] ||
+  fail 'local test credential permissions changed'
+[[ "$(cat "$RUNTIME_CACHE")" == 'local cache marker' ]] ||
+  fail 'local workflow cache was overwritten'
+[[ ! -e "$FAKE_CONFIG/worktrunk/.superpowers" && ! -e "$FAKE_HOME/.superpowers" ]] ||
+  fail 'agent runtime artifacts were installed'
+[[ -L "$FAKE_HOME/.omp/agent/skills/repository-testing/SKILL.md" ]] ||
+  fail 'repository testing and DEV grant procedure was not installed'
 
 # The image opener must be installed outside any transient build/worktree.
 OPENER="$FAKE_HOME/.local/share/omp/herdr-local-files"
