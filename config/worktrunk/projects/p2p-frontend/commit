@@ -1,0 +1,26 @@
+#!/bin/sh
+# Explicitly authorized commits only. Preparation and hooks share one capped slot.
+set -eu
+projects=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ "${1:-}" = --check ]; then
+    shift
+    if [ "$#" -ne 0 ]; then
+        echo 'wt commit -- --check accepts no additional arguments' >&2
+        exit 2
+    fi
+    exec "$projects/project-environment" --profile commit
+fi
+if [ "${1:-}" != --inside ]; then
+    code=0
+    python3 "$projects/p2p-frontend/batch" commit -- "$@" || code=$?
+    # 3 is the explicit ordinary-mode fallback, not a verification failure.
+    if [ "$code" -ne 3 ]; then
+        exit "$code"
+    fi
+fi
+if [ "${1:-}" = --inside ]; then
+    shift
+    "$projects/project-environment" --inside --profile commit --install --prepare
+    exec git commit "$@"
+fi
+exec "$projects/guarded-run" --need 3G --wait 60 -- sh "$0" --inside "$@"

@@ -7,4 +7,4 @@ dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 "$dir/mr-guard"
 
-exec "${GLAB_BIN:-glab}" mr "$@"
+exec python3 "$dir/mr-command" "$@"

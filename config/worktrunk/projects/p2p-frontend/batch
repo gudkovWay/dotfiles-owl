@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""Explicit deferred p2p hooks, cumulative verification and content-bound delivery."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+# These are the existing installed execution/environment authorities, not a
+# second preparation stack bundled into a task worktree.
+PROJECTS = Path.home() / '.config/worktrunk/projects'
+GUARD = PROJECTS / 'guarded-run'
+ENVIRONMENT = PROJECTS / 'project-environment'
+SCHEMA = 1
+NEEDS_COMMIT = 2
+NOT_ACTIVE = 3
+REVIEWED_TASKS = {
+    '*.{js,ts,cjs,mjs}': ['prettier --write --ignore-unknown', 'eslint --fix'],
+    '*.{html,jsx,tsx,vue}': ['prettier --write --ignore-unknown', 'stylelint --fix --allow-empty-input', 'eslint --fix'],
+    '*.{css,scss,less,sass}': ['stylelint --fix --allow-empty-input', 'prettier --write --ignore-unknown'],
+    '*.json': ['prettier --write --ignore-unknown'],
+}
+REVIEWED_PRECOMMIT = {
+    'npx lint-staged --allow-empty\n',
+    '# skip during rebase/merge\n'
+    '[ -d "$(git rev-parse --git-dir)/rebase-merge" ] || [ -d "$(git rev-parse --git-dir)/rebase-apply" ] && exit 0\n'
+    '\nnpx lint-staged --allow-empty\n',
+}
+HUSKY_ENTRY = '#!/usr/bin/env sh\n. "$(dirname "$0")/h"\n'
+HUSKY_DISPATCH = '''#!/usr/bin/env sh
+[ "$HUSKY" = "2" ] && set -x
+n=$(basename "$0")
+s=$(dirname "$(dirname "$0")")/$n
+
+[ ! -f "$s" ] && exit 0
+
+if [ -f "$HOME/.huskyrc" ]; then
+\techo "husky - '~/.huskyrc' is DEPRECATED, please move your code to ~/.config/husky/init.sh"
+fi
+i="${XDG_CONFIG_HOME:-$HOME/.config}/husky/init.sh"
+[ -f "$i" ] && . "$i"
+
+[ "${HUSKY-}" = "0" ] && exit 0
+
+export PATH="node_modules/.bin:$PATH"
+sh -e "$s" "$@"
+c=$?
+
+[ $c != 0 ] && echo "husky - $n script failed (code $c)"
+[ $c = 127 ] && echo "husky - command not found in PATH=$PATH"
+exit $c
+'''
+
+
+class Refused(RuntimeError):
+    """No commit/delivery authorization or trustworthy local proof."""
+
+
+def run(args, cwd, capture=True):
+    result = subprocess.run(args, cwd=cwd, check=True, text=True,
+                            stdout=subprocess.PIPE if capture else None)
+    return result.stdout.strip() if capture else None
+
+
+def git(root, *args):
+    return run(['git', '-C', str(root), *args], root)
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except (ValueError, OSError) as exc:
+        raise Refused(f'unreadable state/config: {path}: {exc}') from exc
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            json.dump(value, file, sort_keys=True)
+            file.write('\n')
+            file.flush()
+            os.fsync(file.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def protected(branch):
+    return branch in {'', 'main', 'master', 'dev'} or branch.startswith(('release', 'refs/'))
+
+
+def registry_path(common, branch):
+    return common / 'wt-batches' / (hashlib.sha256(branch.encode()).hexdigest() + '.json')
+
+
+def commit_options(args):
+    """Inspect options, not message/author values; never implicitly stage paths."""
+    takes_value = {'--message', '--file', '--author', '--date', '--trailer',
+                   '--reuse-message', '--reedit-message', '--fixup', '--squash'}
+    forbidden = {'--all', '--include', '--only', '--no-verify',
+                 '--pathspec-from-file', '--pathspec-file-nul'}
+    index = 0
+    amend = False
+    while index < len(args):
+        arg = args[index]
+        if arg == '--' or not arg.startswith('-'):
+            raise Refused('stage each topic explicitly; commit path arguments are not supported')
+        if arg.startswith('--'):
+            name = arg.split('=', 1)[0]
+            if name in forbidden:
+                raise Refused('batch commits cannot implicitly stage files or disable other hooks')
+            amend = amend or name == '--amend'
+            if name in takes_value and '=' not in arg:
+                index += 1
+                if index >= len(args):
+                    raise Refused(name + ' requires a value')
+        else:
+            for offset, flag in enumerate(arg[1:], 1):
+                if flag in 'aion':
+                    raise Refused('batch commits require explicit staging and preserved hooks')
+                if flag in 'mFCcS':
+                    if offset == len(arg) - 1 and flag != 'S':
+                        index += 1
+                        if index >= len(args):
+                            raise Refused('-' + flag + ' requires a value')
+                    break
+        index += 1
+    return amend
+
+
+class Batch:
+    def __init__(self, root):
+        if any(os.environ.get(name) for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE')):
+            raise Refused('Git path/index overrides are not accepted by batch commands')
+        self.root = Path(git(Path(root), 'rev-parse', '--show-toplevel')).resolve()
+        self.gitdir = Path(git(self.root, 'rev-parse', '--absolute-git-dir')).resolve()
+        self.common = Path(git(self.root, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+        self.branch = git(self.root, 'branch', '--show-current')
+        if protected(self.branch) or self.gitdir == self.common:
+            raise Refused('batch requires a linked task worktree, not integration/detached HEAD')
+        remote = git(self.root, 'remote', 'get-url', 'origin').removesuffix('.git')
+        if not remote.endswith((':common/frontend/frontend', '/common/frontend/frontend')):
+            raise Refused('batch is registered for the p2p repository only')
+        self.directory = self.root / '.superpowers/batch'
+        self.state_path = self.directory / 'state.json'
+        self.marker = registry_path(self.common, self.branch)
+        for part in (self.root / '.superpowers', self.directory, self.state_path):
+            if part.is_symlink():
+                raise Refused(f'batch state must not be a symlink: {part}')
+        ignored = subprocess.run(['git', '-C', str(self.root), 'check-ignore', '-q', '.superpowers/batch/state.json'])
+        if ignored.returncode:
+            raise Refused('.superpowers must be locally ignored before batch state is stored')
+
+    @contextmanager
+    def lock(self):
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.directory / 'lock'
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'a') as file:
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise Refused('this worktree already has an active batch command') from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(file, fcntl.LOCK_UN)
+
+    def clean(self):
+        if git(self.root, 'status', '--porcelain', '--untracked-files=all'):
+            raise Refused('worktree/index is dirty; commit checked fixes explicitly before delivery')
+
+    def head(self):
+        return git(self.root, 'rev-parse', 'HEAD')
+
+    def stable(self):
+        if git(self.root, 'branch', '--show-current') != self.branch:
+            raise Refused('worktree branch changed during batch')
+        for name in ('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'):
+            if (self.gitdir / name).exists():
+                raise Refused('finish the in-progress Git operation before batch commands')
+        if git(self.root, 'ls-files', '-u'):
+            raise Refused('unmerged index entries')
+
+    def hook_contract(self):
+        if os.environ.get('HUSKY') == '0':
+            raise Refused('HUSKY=0 is not an authorized batch mode')
+        for init in (Path.home() / '.huskyrc', Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'husky/init.sh'):
+            if init.exists() and init.read_text().strip():
+                raise Refused(f'review Husky init before deferring hooks: {init}')
+        tasks = read_json(self.root / 'package.json').get('lint-staged')
+        if tasks != REVIEWED_TASKS:
+            raise Refused('lint-staged tasks changed; review the batch hook contract')
+        tracked = subprocess.check_output(['git', '-C', str(self.root), 'ls-files', '-z']).decode().split('\0')
+        for name in filter(None, tracked):
+            path = Path(name)
+            if path.name.startswith(('.lintstagedrc', 'lint-staged.config.')):
+                raise Refused('additional lint-staged configuration requires review: ' + name)
+            if name != 'package.json' and path.name == 'package.json' and (self.root / path).is_file():
+                package = read_json(self.root / path)
+                if 'lint-staged' in package:
+                    raise Refused('nested lint-staged tasks require review: ' + name)
+        hooks = Path(git(self.root, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks'))
+        precommit = hooks / 'pre-commit'
+        husky = self.root / '.husky'
+        portable = hooks == husky / '_' or (precommit.is_file() and precommit.read_text() == HUSKY_ENTRY)
+        if not precommit.is_file() and hooks == self.common / 'hooks' and (husky / 'pre-commit').is_file():
+            active = [path for path in hooks.iterdir() if path.is_file() and os.access(path, os.X_OK) and not path.name.endswith('.sample')] if hooks.exists() else []
+            if active:
+                raise Refused('uninitialized Husky plus other effective hooks requires explicit review')
+            portable = True
+        if portable:
+            # A fresh linked worktree has tracked Husky scripts but no generated
+            # _/ dispatchers until install. Deferral must not require that install.
+            script = husky / 'pre-commit'
+            if not script.is_file() or subprocess.run(['git', '-C', str(self.root), 'ls-files', '--error-unmatch', '.husky/pre-commit'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                raise Refused('portable Husky pre-commit must be tracked in this worktree')
+            generated = husky / '_'
+            if hooks not in {generated, self.common / 'hooks'}:
+                raise Refused('external Husky dispatchers are outside the reviewed worktree')
+            if generated.exists():
+                dispatch = generated / 'h'
+                if not dispatch.is_file() or dispatch.read_text() != HUSKY_DISPATCH:
+                    raise Refused('Husky dispatcher changed; review before deferring pre-commit')
+                for path in generated.iterdir():
+                    if path.is_file() and path.name not in {'h', 'husky.sh', '.gitignore'} and path.read_text() not in {HUSKY_ENTRY, HUSKY_ENTRY.removesuffix('\n')}:
+                        raise Refused('generated Husky hook changed: ' + str(path))
+            body = script.read_text()
+            callbacks = {path.name: (path, True) for path in sorted(husky.iterdir()) if path.is_file()}
+        else:
+            if not precommit.is_file() or not os.access(precommit, os.X_OK):
+                raise Refused('effective pre-commit is missing/inactive; no reviewed hook to defer')
+            body = precommit.read_text().removeprefix('#!/bin/sh\n').removeprefix('#!/usr/bin/env sh\n')
+            callbacks = {path.name: (path, False) for path in sorted(hooks.iterdir())
+                         if path.is_file() and os.access(path, os.X_OK) and not path.name.endswith('.sample')}
+        if body not in REVIEWED_PRECOMMIT:
+            raise Refused('pre-commit contains unreviewed checks; refusing to skip them')
+        files = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path, _ in callbacks.values()}
+        return callbacks, digest({'files': files, 'tasks': tasks, 'portable_husky': portable})
+
+    def load(self):
+        state = read_json(self.state_path)
+        required = {'schema', 'root', 'gitdir', 'branch', 'start', 'base', 'base_sha', 'merge_base', 'contract', 'active', 'receipt'}
+        if not isinstance(state, dict) or set(state) != required or type(state['schema']) is not int or state['schema'] != SCHEMA:
+            raise Refused('invalid batch state schema; no proof accepted')
+        if type(state['active']) is not bool or not isinstance(state['base'], str) or state['base'].startswith('-'):
+            raise Refused('invalid batch mode/base')
+        for name in ('start', 'base_sha', 'merge_base'):
+            value = state[name]
+            if not isinstance(value, str) or len(value) not in (40, 64) or any(c not in '0123456789abcdef' for c in value):
+                raise Refused('invalid batch commit identity: ' + name)
+        if state['receipt'] is not None and not isinstance(state['receipt'], dict):
+            raise Refused('invalid batch receipt')
+        if (state['root'], state['gitdir'], state['branch']) != (str(self.root), str(self.gitdir), self.branch):
+            raise Refused('batch proof belongs to another worktree/branch')
+        marker = read_json(self.marker)
+        if marker != {'schema': SCHEMA, 'branch': self.branch, 'root': str(self.root)}:
+            raise Refused('batch registration mismatch')
+        return state
+
+    def save(self, state):
+        atomic_json(self.state_path, state)
+
+    def validate(self, state):
+        self.stable()
+        if git(self.root, 'rev-parse', '--verify', state['base'] + '^{commit}') != state['base_sha']:
+            raise Refused('base moved; run wt batch -- begin --base origin/dev --refresh, then verify')
+        if subprocess.run(['git', '-C', str(self.root), 'merge-base', '--is-ancestor', state['start'], 'HEAD']).returncode:
+            raise Refused('batch history was rewritten; refresh the base and verify again')
+        hooks, contract = self.hook_contract()
+        if contract != state['contract']:
+            raise Refused('Git hook contract changed; explicit review/refresh required')
+        return hooks
+
+    def begin(self, base, refresh=False):
+        self.stable()
+        loader = importlib.machinery.SourceFileLoader('wt_batch_owner', str(HERE / 'mr-command'))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        owner = importlib.util.module_from_spec(spec)
+        loader.exec_module(owner)
+        try:
+            owner.ensure_idle(self.root)
+        except owner.Deferred as exc:
+            raise Refused(str(exc)) from exc
+        self.clean()
+        old = self.load() if self.state_path.exists() else None
+        if self.marker.exists() and old is None:
+            raise Refused('registered batch state is missing; recover it, do not bypass its gate')
+        if refresh and old is None:
+            raise Refused('no existing batch to refresh')
+        if old and old['active'] and not refresh:
+            raise Refused('batch already active; use status, or explicit --refresh after synchronization')
+        if not base or base.startswith('-'):
+            raise Refused('an explicit existing base ref is required')
+        base_sha = git(self.root, 'rev-parse', '--verify', base + '^{commit}')
+        merge_base = git(self.root, 'merge-base', base_sha, 'HEAD')
+        _, contract = self.hook_contract()
+        state = {'schema': SCHEMA, 'root': str(self.root), 'gitdir': str(self.gitdir),
+                 'branch': self.branch, 'start': self.head(), 'base': base,
+                 'base_sha': base_sha, 'merge_base': merge_base, 'contract': contract,
+                 'active': True, 'receipt': None}
+        # A Git-local registration preserves the fail-closed gate if ignored
+        # worktree state is accidentally removed. It is not shared Git config.
+        atomic_json(self.marker, {'schema': SCHEMA, 'branch': self.branch, 'root': str(self.root)})
+        self.save(state)
+        print(f'wt-batch: active on {self.branch}; pinned base {base_sha}')
+
+    def commit(self, args):
+        state = self.load()
+        if not state['active']:
+            return NOT_ACTIVE
+        hooks = self.validate(state)
+        amend = commit_options(args)
+        if amend:
+            if self.head() == state['start']:
+                raise Refused('cannot amend the batch starting commit')
+            state['receipt'] = None
+        elif state['receipt']:
+            state['receipt']['head'] = None
+        self.save(state)
+        with tempfile.TemporaryDirectory(prefix='hooks-', dir=self.directory) as directory:
+            proxy = Path(directory)
+            for name, (original, portable) in hooks.items():
+                if name == 'pre-commit':
+                    text = '#!/bin/sh\nexit 0\n'
+                elif portable:
+                    text = ('#!/bin/sh\nexport PATH=' + shlex.quote(str(self.root / 'node_modules/.bin'))
+                            + ':\"$PATH\"\nexec sh -e ' + shlex.quote(str(original)) + ' \"$@\"\n')
+                else:
+                    text = '#!/bin/sh\nexec ' + shlex.quote(str(original)) + ' \"$@\"\n'
+                target = proxy / name
+                target.write_text(text)
+                target.chmod(0o700)
+            command = ['git', '-c', 'core.hooksPath=' + str(proxy), 'commit', *args]
+            if any(name != 'pre-commit' for name in hooks):
+                # Retained user hooks may be heavy; do not run unknown work
+                # outside the shared caps. No prepare/lint-staged is added.
+                command = [str(GUARD), '--need', '3G', '--wait', '60', '--exclusive-key', str(self.root), '--', *command]
+            return subprocess.call(command, cwd=self.root)
+
+    def environment_status(self):
+        output = run([str(ENVIRONMENT), '--profile', 'commit'], self.root)
+        rows = [json.loads(row) for row in output.splitlines() if row.startswith('{')]
+        if not rows or rows[-1].get('dependencies') != 'ready' or rows[-1].get('generated') != 'ready':
+            raise Refused('commit environment is missing/stale; run batch verify, not delivery')
+        return rows[-1]
+
+    def environment_key(self):
+        status = self.environment_status()
+        paths = [self.root / 'node_modules/.omp-environment.json', ENVIRONMENT, GUARD, HERE / 'batch']
+        paths += [self.root / name for name in status['required_generated']]
+        paths += [self.root / 'node_modules' / name / 'package.json' for name in ('lint-staged', 'prettier', 'eslint', 'stylelint')]
+        values = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+        values['node'] = run(['node', '--print', 'JSON.stringify({version:process.version,abi:process.versions.modules})'], self.root)
+        return digest(values)
+
+    def prepare_environment(self):
+        # --inside alone is not proof: ask the authoritative guard before setup.
+        run([str(GUARD), '--check-inside'], self.root, capture=False)
+        run([str(ENVIRONMENT), '--inside', '--profile', 'commit', '--install', '--prepare'], self.root, capture=False)
+
+    def run_lint(self, revision):
+        binary = self.root / 'node_modules/lint-staged/bin/lint-staged.js'
+        if not binary.is_file():
+            raise Refused('installed lint-staged entrypoint missing; no network-resolving fallback')
+        run(['node', str(binary), '--config', str(self.root / 'package.json'),
+             '--diff=' + revision, '--concurrent', 'false'], self.root, capture=False)
+
+    def verify_inside(self):
+        state = self.load()
+        self.validate(state)
+        self.clean()
+        state['receipt'] = None
+        self.save(state)
+        self.prepare_environment()
+        environment = self.environment_key()
+        checked_head = self.head()
+        self.run_lint(state['merge_base'] + '...HEAD')
+        self.validate(state)
+        if self.head() != checked_head or self.environment_key() != environment:
+            raise Refused('HEAD/environment changed during verification; no success proof')
+        if subprocess.run(['git', '-C', str(self.root), 'diff', '--quiet']).returncode:
+            raise Refused('hook left unstaged changes; inspect/stage explicitly and verify again')
+        tree = git(self.root, 'write-tree')
+        clean = not git(self.root, 'status', '--porcelain', '--untracked-files=all')
+        state['receipt'] = {'tree': tree, 'checked_head': checked_head,
+                            'head': checked_head if clean else None, 'environment': environment}
+        self.save(state)
+        if not clean:
+            print('wt-batch: needs-commit; inspect autofixes and commit them by topic, then run wt batch -- check')
+            return NEEDS_COMMIT
+        print(f'wt-batch: hooks verified for {checked_head}; tests/typecheck/CI remain independent')
+        return 0
+
+    def check(self):
+        state = self.load()
+        self.validate(state)
+        self.clean()
+        receipt = state['receipt']
+        if not isinstance(receipt, dict) or set(receipt) != {'tree', 'checked_head', 'head', 'environment'}:
+            raise Refused('no successful cumulative hook proof; run wt batch -- verify')
+        if receipt['tree'] != git(self.root, 'rev-parse', 'HEAD^{tree}'):
+            raise Refused('committed content differs from verified tree; run verify again')
+        if subprocess.run(['git', '-C', str(self.root), 'merge-base', '--is-ancestor', receipt['checked_head'], 'HEAD']).returncode:
+            raise Refused('verified history rewritten; run verify again')
+        if receipt['environment'] != self.environment_key():
+            raise Refused('verification environment changed; run verify again')
+        receipt['head'] = self.head()
+        self.save(state)
+        print(f'wt-batch: hook proof current for {receipt["head"]}')
+        return receipt['head']
+
+    def push(self, args):
+        if len(args) != 2 or args[0].startswith('-') or args[1] != self.branch:
+            raise Refused('usage: wt push -- <configured-remote> <current-task-branch>; no force/multiple refspecs')
+        remote, branch = args
+        git(self.root, 'remote', 'get-url', '--push', remote)
+        for name in ('push.followTags', 'remote.' + remote + '.mirror'):
+            value = subprocess.run(['git', '-C', str(self.root), 'config', '--bool', '--get', name], text=True, stdout=subprocess.PIPE)
+            if value.returncode not in (0, 1) or value.stdout.strip() == 'true':
+                raise Refused('push config would broaden checked refs: ' + name)
+        recurse = subprocess.run(['git', '-C', str(self.root), 'config', '--get', 'push.recurseSubmodules'], text=True, stdout=subprocess.PIPE)
+        if recurse.returncode not in (0, 1) or recurse.stdout.strip() not in ('', 'no', 'false'):
+            raise Refused('recursive submodule pushes are outside this batch gate')
+        self.check()
+        command = ['git', 'push', remote, f'refs/heads/{branch}:refs/heads/{branch}']
+        if 'pre-push' in self.hook_contract()[0]:
+            command = [str(GUARD), '--need', '3G', '--wait', '60', '--exclusive-key', str(self.root), '--', *command]
+        result = subprocess.call(command, cwd=self.root)
+        if result == 0:
+            state = self.load()
+            state['active'] = False
+            self.save(state)
+        return result
+
+
+def check_source(root, branch, expected_sha=None, require_remote=False):
+    common = Path(git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+    marker = registry_path(common, branch)
+    if not marker.exists():
+        return  # Ordinary non-batch MR delivery retains its existing behavior.
+    registration = read_json(marker)
+    if not isinstance(registration, dict) or set(registration) != {'schema', 'branch', 'root'} or registration['schema'] != SCHEMA or registration['branch'] != branch:
+        raise Refused('invalid source batch registration')
+    source_root = Path(registration['root'])
+    if not source_root.is_dir():
+        raise Refused('registered source worktree is missing; recover its batch proof before delivery')
+    source = Batch(source_root)
+    if source.branch != branch:
+        raise Refused('registered source worktree now contains another branch')
+    with source.lock():
+        head = source.check()
+        if expected_sha is not None and head != expected_sha:
+            raise Refused('MR/remote source SHA differs from checked local batch HEAD')
+        if require_remote:
+            ref = 'refs/heads/' + branch
+            rows = git(source.root, 'ls-remote', '--heads', 'origin', ref).splitlines()
+            if len(rows) != 1 or rows[0].split() != [head, ref]:
+                raise Refused('origin source is missing/stale; use authorized wt push before MR creation')
+
+def retire_registration(root, branch):
+    """Remove only our local pointer after source refs/worktree are gone."""
+    common = Path(git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+    marker = registry_path(common, branch)
+    if not marker.exists():
+        return
+    registration = read_json(marker)
+    if not isinstance(registration, dict) or set(registration) != {'schema', 'branch', 'root'} or registration['schema'] != SCHEMA or registration['branch'] != branch:
+        raise Refused('invalid batch registration; preserving it')
+    git(root, 'check-ref-format', '--branch', branch)
+    ref = 'refs/heads/' + branch
+    local = subprocess.run(['git', '-C', str(root), 'show-ref', '--verify', '--quiet', ref])
+    if local.returncode != 1 or 'branch ' + ref in git(root, 'worktree', 'list', '--porcelain').splitlines():
+        raise Refused('source still exists locally; registration retained')
+    if Path(registration['root']).exists() or git(root, 'ls-remote', '--heads', 'origin', ref):
+        raise Refused('source worktree/remote still exists; registration retained')
+    # No product refs or worktree contents are removed here.
+    if read_json(marker) != registration:
+        raise Refused('batch registration changed during cleanup')
+    marker.unlink()
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    begin = sub.add_parser('begin')
+    begin.add_argument('--base', required=True)
+    begin.add_argument('--refresh', action='store_true')
+    verify = sub.add_parser('verify')
+    verify.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
+    sub.add_parser('check')
+    sub.add_parser('status')
+    commit = sub.add_parser('commit')
+    commit.add_argument('args', nargs=argparse.REMAINDER)
+    push = sub.add_parser('push')
+    push.add_argument('args', nargs=argparse.REMAINDER)
+    delivery = sub.add_parser('delivery')
+    delivery.add_argument('--branch', required=True)
+    delivery.add_argument('--sha')
+    delivery.add_argument('--remote', action='store_true')
+    retire = sub.add_parser('retire', help='retire local registration after completed MR cleanup')
+    retire.add_argument('--branch', required=True)
+    args = parser.parse_args()
+    root = Path.cwd()
+    if args.command == 'delivery':
+        check_source(root, args.branch, args.sha, args.remote)
+        return 0
+    if args.command == 'retire':
+        retire_registration(root, args.branch)
+        return 0
+    # Absence is only an ordinary-mode fallback if no persistent registration
+    # exists. An accidentally deleted .superpowers directory is not an escape.
+    if args.command == 'commit':
+        branch = git(root, 'branch', '--show-current')
+        common = Path(git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
+        if not registry_path(common, branch).exists():
+            return NOT_ACTIVE
+    batch = Batch(root)
+    if args.command == 'verify' and not args.inside:
+        with batch.lock():
+            state = batch.load()
+            batch.validate(state)
+            batch.clean()
+            state['receipt'] = None
+            batch.save(state)
+        return subprocess.call([str(GUARD), '--need', '3G', '--wait', '60', '--exclusive-key', str(batch.root), '--',
+                                sys.executable, str(HERE / 'batch'), 'verify', '--inside'], cwd=batch.root)
+    with batch.lock():
+        if args.command == 'begin':
+            batch.begin(args.base, args.refresh)
+        elif args.command == 'status':
+            print(json.dumps(batch.load(), sort_keys=True))
+        elif args.command == 'check':
+            batch.check()
+        elif args.command == 'verify':
+            return batch.verify_inside()
+        elif args.command in {'commit', 'push'}:
+            forwarded = args.args[1:] if args.args[:1] == ['--'] else args.args
+            return getattr(batch, args.command)(forwarded)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (Refused, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(f'wt-batch: refused: {exc}', file=sys.stderr)
+        raise SystemExit(1)

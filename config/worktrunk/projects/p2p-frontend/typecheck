@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Native app typecheck with a fixed shared-guard reservation and kernel metrics."""
+import argparse
+import json
+import os
+from pathlib import Path
+import resource
+import subprocess
+import sys
+import time
+
+APPS = ('payscrow-admin', 'payscrow-form', 'payscrow-merchant', 'payscrow-provider',
+        'lucky-admin', 'lucky-form', 'lucky-merchant', 'exchange-form')
+GUARD = '/home/q/.config/worktrunk/projects/guarded-run'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('app', choices=APPS)
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    root = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip()).resolve()
+    if not (root / 'apps' / args.app / 'tsconfig.json').is_file():
+        parser.error('app not found in this worktree')
+    os.chdir(root)
+    if not args.inside:
+        command = [GUARD, '--memory', '6G', '--wait', '60', '--exclusive-key', str(root)]
+        if args.dry_run:
+            command.append('--dry-run')
+        command += ['--', sys.executable, str(Path(__file__).resolve()), args.app, '--inside']
+        os.execv(GUARD, command)
+
+    # Do not let --inside become an uncapped alternate entrypoint.
+    subprocess.run([GUARD, '--check-inside'], check=True)
+    relative = Path('/proc/self/cgroup').read_text().strip().split('::', 1)[1]
+    cgroup = Path('/sys/fs/cgroup') / relative.lstrip('/')
+    before = dict(line.split() for line in (cgroup / 'memory.events').read_text().splitlines())
+    started = time.monotonic()
+    result = subprocess.run(['bash', 'scripts/typecheck-app.sh', args.app, '0'],
+                            env={**os.environ, 'NODE_ENV': 'test', 'CONSOLA_LEVEL': '0'})
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    after = dict(line.split() for line in (cgroup / 'memory.events').read_text().splitlines())
+    print(json.dumps({'app': args.app, 'exit': result.returncode,
+                      'elapsed_seconds': round(time.monotonic() - started, 2),
+                      'cpu_seconds': round(usage.ru_utime + usage.ru_stime, 2),
+                      'max_process_rss_bytes': usage.ru_maxrss * 1024,
+                      'scope_peak_bytes': int((cgroup / 'memory.peak').read_text()),
+                      'memory_events_delta': {key: int(value) - int(before[key]) for key, value in after.items()}},
+                     ensure_ascii=False), flush=True)
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
+
+
+if __name__ == '__main__':
+    sys.exit(main())
