@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Guarded GitLab MR delivery to dev; source cleanup is a separate explicit action."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import feature_finalize as finalizer
+from merge_readiness import assert_ref_idle, merge_args, validate_mr, wait_for_ci
+
+GLAB = os.environ.get('GLAB_BIN', 'glab')
+
+
+class Deferred(Exception):
+    """Merge succeeded, but local work must be preserved."""
+
+
+def run(args, cwd=None, capture=True):
+    return subprocess.run(args, cwd=cwd, check=True, text=True,
+                          stdout=subprocess.PIPE if capture else None)
+
+
+def git(*args, cwd=None):
+    return run(['git', *args], cwd=cwd).stdout.strip()
+
+
+def glab_json(*args):
+    return json.loads(run([GLAB, *args]).stdout)
+
+
+def require_batch_proof(source, sha=None, require_remote=False):
+    if not isinstance(source, str) or not source:
+        raise ValueError('MR source branch is missing')
+    if not require_remote and (not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha)):
+        raise ValueError('MR source SHA is missing or invalid')
+    command = [sys.executable, str(Path(__file__).resolve().parent / 'batch'),
+               'delivery', '--branch', source]
+    if sha is not None:
+        command += ['--sha', sha]
+    if require_remote:
+        command.append('--remote')
+    run(command, capture=False)
+
+
+def option(args, long, short=None):
+    value = None
+    for index, arg in enumerate(args):
+        if arg == long or (short and arg == short):
+            if index + 1 >= len(args):
+                raise ValueError(f'{arg} requires a value')
+            value = args[index + 1]
+        elif arg.startswith(long + '='):
+            value = arg.split('=', 1)[1]
+        elif short and arg.startswith(short) and len(arg) > len(short):
+            value = arg[len(short):].lstrip('=')
+    return value
+
+
+def remove_source_args(args, merge=False):
+    # Preserve the source by default; cleanup is explicit and checks ref consumers.
+    result = []
+    flags = {'--remove-source-branch', '-d'} if merge else {'--remove-source-branch'}
+    prefixes = tuple(flag + '=' for flag in flags)
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in flags or arg.startswith(prefixes):
+            if arg in flags and index + 1 < len(args) and args[index + 1] in {'true', 'false'}:
+                index += 1
+        else:
+            result.append(arg)
+        index += 1
+    return [*result, '--remove-source-branch=false']
+
+
+def merge_selector(args):
+    value_flags = {'--sha', '--message', '-m', '--squash-message', '--repo', '-R'}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in value_flags:
+            index += 2
+        elif arg.startswith('-'):
+            index += 1
+        else:
+            return arg
+    return git('branch', '--show-current')
+
+
+def view(selector):
+    return glab_json('mr', 'view', selector, '--output', 'json')
+
+
+def local_project(args):
+    # Cross-project operations remain glab operations, never local cleanup.
+    return option(args, '--repo', '-R') is None and option(args, '--head', '-H') is None
+
+
+def ancestors():
+    own = set()
+    pid = os.getpid()
+    while pid > 1 and pid not in own:
+        own.add(pid)
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        pid = int(fields[1])
+    return own
+
+
+def session_manager(process):
+    # Linux makes the user manager and its PAM helper nondumpable. They manage
+    # the login session, not a worktree; recognize the pair, not arbitrary names.
+    args = process.joinpath('cmdline').read_bytes().rstrip(b'\0').split(b'\0')
+    parent = process.joinpath('stat').read_text().rsplit(')', 1)[1].split()[1]
+    if args == [b'/usr/lib/systemd/systemd', b'--user'] and parent == '1':
+        return True
+    if args == [b'(sd-pam)']:
+        return session_manager(Path('/proc') / parent)
+    return False
+
+
+def ensure_idle(tree):
+    # Do not reap, kill, or override an owner. Only this command's transient
+    # noninteractive shell/Worktrunk ancestors may run from the removed tree.
+    own = ancestors()
+    root = tree.resolve()
+    for process in Path('/proc').iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            if session_manager(process):
+                continue
+            cwd = process.joinpath('cwd').resolve(strict=True)
+            if cwd != root and root not in cwd.parents:
+                continue
+            pid = int(process.name)
+            if pid == os.getpid():
+                continue
+            fields = process.joinpath('stat').read_text().rsplit(')', 1)[1].split()
+            executable = process.joinpath('comm').read_text().strip()
+            if pid in own and executable in {'wt', 'sh', 'dash', 'bash', 'fish', 'zsh'} and fields[4] == '0':
+                continue
+            raise Deferred(f'worktree is in use by PID {pid} ({executable})')
+        except FileNotFoundError:
+            continue  # Process exited during discovery.
+        except PermissionError as exc:
+            raise Deferred(f'cannot establish process ownership: {process.name}') from exc
+
+
+def worktrees():
+    records = []
+    for block in git('worktree', 'list', '--porcelain', '-z').split('\0\0'):
+        record = {}
+        for line in block.split('\0'):
+            key, _, value = line.partition(' ')
+            record[key] = value
+        if 'worktree' in record:
+            records.append(record)
+    return records
+
+
+def local_tip(branch):
+    result = subprocess.run(['git', 'rev-parse', '--verify', '--quiet', f'refs/heads/{branch}'],
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode == 1:
+        return None
+    result.check_returncode()
+    return result.stdout.strip()
+
+
+def check_local(branch, sha, trees):
+    tip = local_tip(branch)
+    if tip is not None and tip != sha:
+        raise Deferred('local source tip differs from the merged MR; preserving new work')
+    matches = [row for row in trees if row.get('branch') == f'refs/heads/{branch}']
+    if len(matches) > 1:
+        raise Deferred('source branch is checked out in multiple worktrees')
+    for row in matches:
+        tree = Path(row['worktree'])
+        if 'locked' in row or 'prunable' in row:
+            raise Deferred('source worktree is locked or unavailable')
+        if git('status', '--porcelain', '--untracked-files=all', cwd=tree):
+            raise Deferred('source worktree has uncommitted or untracked work')
+        ensure_idle(tree)
+    return matches
+
+
+def protected_source(branch):
+    return branch in {'dev', 'main', 'master'} or branch.startswith('release')
+
+
+def source_details(mr):
+    if not mr.get('source_project_id') or mr['source_project_id'] != mr.get('target_project_id'):
+        raise ValueError('cannot clean up a fork or unidentified source project')
+    branch, sha = mr['source_branch'], mr['sha']
+    if protected_source(branch):
+        raise ValueError('refusing to delete a protected integration/release source')
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', sha):
+        raise ValueError('MR source SHA is missing or invalid')
+    git('check-ref-format', '--branch', branch)
+    return branch, sha
+
+
+def cleanup(mr):
+    if mr.get('target_branch') != 'dev':
+        raise ValueError('cleanup is only allowed for a merge into dev')
+    if mr.get('state') != 'merged' or not mr.get('merged_at'):
+        print(f'mr-cleanup: pending; MR is not merged, source preserved. Finish with: wt mr -- cleanup {mr["iid"]}')
+        return
+    branch, sha = source_details(mr)
+    trees = worktrees()
+    primary = Path(trees[0]['worktree'])
+    matches = check_local(branch, sha, trees)
+    if matches and Path(matches[0]['worktree']) == primary:
+        raise Deferred('source is the primary checkout; switch it before cleanup')
+    assert_ref_idle(primary, branch)
+    # The wrapper may have been invoked inside the source being removed.
+    os.chdir(primary)
+    git('fetch', '--prune', 'origin', cwd=primary)
+    # Rebase/squash can replace the source SHA. GitLab identifies the result
+    # commit; Worktrunk still independently checks integration before deletion.
+    proof = mr.get('squash_commit_sha') or mr.get('merge_commit_sha') or sha
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', proof):
+        raise ValueError('MR result SHA is missing or invalid')
+    git('merge-base', '--is-ancestor', proof, 'refs/remotes/origin/dev', cwd=primary)
+    ref = f'refs/heads/{branch}'
+    remote = git('ls-remote', '--heads', 'origin', ref, cwd=primary)
+    if remote:
+        if remote.split()[0] != sha:
+            raise ValueError('remote source advanced after merge; source preserved')
+        # Compare-and-swap: a simultaneous push must not be erased.
+        git('push', f'--force-with-lease={ref}:{sha}', 'origin', f':{ref}', cwd=primary)
+        git('fetch', '--prune', 'origin', cwd=primary)
+    matches = check_local(branch, sha, worktrees())
+    if local_tip(branch) is None and not matches:
+        run([sys.executable, str(Path(__file__).resolve().parent / 'batch'),
+             'retire', '--branch', branch], cwd=primary, capture=False)
+        print(f'mr-cleanup: complete; {branch} already absent locally and in origin')
+        return
+    result = run(['wt', 'remove', branch, '--foreground', '--format', 'json'], cwd=primary)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'invalid Worktrunk removal result: {result.stdout!r}') from exc
+    records = payload if isinstance(payload, list) else [payload]
+    if len(records) != 1 or not isinstance(records[0], dict) or records[0].get('branch_outcome') != 'deleted':
+        raise Deferred(f'Worktrunk retained source: {result.stdout.strip()}')
+    if local_tip(branch) is not None:
+        raise Deferred('local source ref still exists')
+    if matches and Path(matches[0]['worktree']).exists():
+        raise Deferred('source worktree still exists')
+    if git('ls-remote', '--heads', 'origin', ref, cwd=primary):
+        raise Deferred('remote source was recreated during cleanup; new work preserved')
+    run([sys.executable, str(Path(__file__).resolve().parent / 'batch'),
+         'retire', '--branch', branch], cwd=primary, capture=False)
+    print(f'mr-cleanup: complete; deleted origin/{branch}, local branch and worktree')
+
+
+def merge_feature(mr, args):
+    root = finalizer.owned_root(Path(git('rev-parse', '--show-toplevel')))
+    finalizer.refresh(root)
+    current = finalizer.snapshot(root)
+    validate_mr(mr, current['branch'], current['head'])
+    requested_sha = option(args, '--sha')
+    if requested_sha is not None and requested_sha != current['head']:
+        raise ValueError('requested merge SHA differs from current source')
+    if any(arg in {'--rebase', '-r', '--squash', '-s'} for arg in args):
+        raise ValueError('automatic finalization does not rewrite/squash feature history')
+    if not finalizer.hotfix(current['branch']) and not finalizer.current_receipt(root, current):
+        return subprocess.call([str(Path(__file__).resolve().parent / 'feature-finalize'),
+                                '--mr', str(mr['iid'])], cwd=root)
+    require_batch_proof(current['branch'], current['head'])
+    ci = wait_for_ci(root, mr['iid'], current['branch'], current['head'],
+                     finalizer.ci_requirements(root, current))
+    # Recheck the target immediately before merge: local stale tracking refs
+    # cannot make an obsolete review receipt current.
+    finalizer.refresh(root)
+    if finalizer.snapshot(root) != current:
+        raise ValueError('source/target moved after CI; finalization must be refreshed')
+    result = subprocess.call([GLAB, *merge_args(mr['iid'], current['head'])], cwd=root)
+    if result:
+        return result
+    delivered = view(str(mr['iid']))
+    if delivered.get('state') != 'merged' or delivered.get('sha') != current['head']:
+        raise ValueError('merge command returned but exact-SHA merge is not confirmed')
+    finalizer.refresh(root)
+    proof = delivered.get('squash_commit_sha') or delivered.get('merge_commit_sha') or current['head']
+    git('merge-base', '--is-ancestor', proof, 'refs/remotes/origin/dev', cwd=root)
+    print(json.dumps({'state': 'merged', 'target': 'dev', 'sha': current['head'],
+                      'source_preserved': True, 'ci': ci}, ensure_ascii=False))
+    return 0
+
+
+def main(args):
+    if not args:
+        return subprocess.call([GLAB, 'mr'])
+    command, *rest = args
+    help_requested = any(arg in {'--help', '-h'} for arg in rest)
+    if command == 'cleanup':
+        if help_requested:
+            print('Usage: wt mr -- cleanup <MR id | source branch>\n'
+                  'Finish cleanup after a confirmed merge into dev. Never force or reap.')
+            return 0
+        if len(rest) != 1 or rest[0].startswith('-'):
+            raise ValueError('cleanup requires one MR id or source branch')
+        cleanup(view(rest[0]))
+        return 0
+    if help_requested:
+        return subprocess.call([GLAB, 'mr', *args])
+    if not local_project(rest):
+        if command in {'merge', 'accept'}:
+            raise ValueError('cross-project merge flags are outside the local p2p gate')
+        return subprocess.call([GLAB, 'mr', *args])
+    if command in {'create', 'new'}:
+        target = option(rest, '--target-branch', '-b')
+        if target is None:
+            target = glab_json('api', 'projects/:id')['default_branch']
+        source = option(rest, '--source-branch', '-s') or git('branch', '--show-current')
+        require_batch_proof(source, require_remote=True)
+        if target == 'dev' and not protected_source(source):
+            rest = remove_source_args(rest)
+        return subprocess.call([GLAB, 'mr', command, *rest])
+    if command in {'merge', 'accept'}:
+        mr = view(merge_selector(rest))
+        # Reject a missing registered batch proof before fetch/model/forge work.
+        require_batch_proof(mr.get('source_branch'), mr.get('sha'))
+        if mr.get('target_branch') != 'dev':
+            return subprocess.call([GLAB, 'mr', *args])
+        return merge_feature(mr, rest)
+    return subprocess.call([GLAB, 'mr', *args])
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except (Deferred, ValueError, RuntimeError, KeyError, OSError, subprocess.SubprocessError) as exc:
+        print(f'mr-cleanup: incomplete; {exc}', file=sys.stderr)
+        raise SystemExit(1)

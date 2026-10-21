@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Publish owned p2p worktrees and bootstrap PSC only from observed empty state."""
+import argparse
+from contextlib import contextmanager
+from datetime import datetime
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote, urlencode
+
+HERE = Path(__file__).resolve().parent
+HOST = 'gitlab.psclp.org'
+WEB = 'https://' + HOST + '/common/frontend/frontend'
+PROJECT = 'projects/40'
+ROLES = ('admin', 'form', 'merchant', 'provider')
+PREFIX = 'DEV-capitalism-slave-'
+loader = importlib.machinery.SourceFileLoader('wt_stand_batch', str(HERE / 'batch'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+batch = importlib.util.module_from_spec(spec)
+loader.exec_module(batch)
+
+
+class Refused(RuntimeError):
+    def __init__(self, message, published=False):
+        super().__init__(message)
+        self.published = published
+
+
+def impact(paths):
+    selected, ignored, unsupported = set(), [], []
+    for path in paths:
+        name = Path(path).name
+        if (path.startswith(('docs/', '.superpowers/', '.omp/', '.husky/'))
+                or name.endswith(('.md', '.test.ts', '.test.js', '.spec.ts', '.spec.js'))
+                or name.startswith(('vitest.', 'playwright.'))
+                or path in {'.gitlab-ci.yml', '.gitignore', 'scripts/typecheck-app.sh'}
+                or name == 'pipeline.yaml'):
+            ignored.append(path)
+            continue
+        if path.startswith(('apps/lucky-', 'apps/exchange-form/', 'lib/form-layer/ui/exchange/')):
+            unsupported.append(path)
+            continue
+        role = next((role for role in ROLES
+                     if path.startswith((f'lib/{role}-layer/', f'apps/payscrow-{role}/'))
+                     or path == f'.kubernetes/values-template-{role}.yaml'), None)
+        if role:
+            selected.add(role)
+        elif path.startswith('lib/common-layer/') or path in {'package.json', 'package-lock.json', 'Dockerfile'}:
+            selected.update(ROLES)
+        else:
+            unsupported.append(path)
+    return {'roles': [role for role in ROLES if role in selected],
+            'ignored': ignored, 'unsupported': unsupported}
+
+
+def deploy_variables(roles):
+    if not roles or not set(roles).issubset(ROLES):
+        raise Refused('PSC roles must be a nonempty subset of admin/form/merchant/provider')
+    aliases = ['ALL', 'PSC', 'LP', 'OCK', 'EXC_FORM']
+    aliases += ['ALL_' + role.upper() for role in ROLES]
+    aliases += [wl + '_' + role.upper() for wl in ('PSC', 'LP', 'OCK') for role in ROLES]
+    enabled = {'PSC_' + role.upper() for role in roles}
+    return [{'key': 'GLA_DEPLOY_' + alias, 'value': 'true' if alias in enabled else 'false',
+             'variable_type': 'env_var'} for alias in aliases]
+
+
+def trace_state(text):
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    state = 'unknown'
+    for line in text.splitlines():
+        if 'Нет активных подписок' in line:
+            state = 'none'
+        elif ('Повторное развёртывание подписанных whitelabel' in line
+              or 'Развёртывание целевых whitelabel' in line):
+            match = re.search(r'\blabels=(?:"([^\"]*)"|(\S+))', line)
+            if not match:
+                state = 'unknown'
+                continue
+            labels = {label.strip() for label in (match.group(1) or match.group(2) or '').split(',')}
+            state = 'psc' if labels == {'psc'} else 'other' if labels - {''} else 'unknown'
+    return state
+
+
+def variable_state(variables):
+    if not isinstance(variables, list) or any(not isinstance(item, dict) for item in variables):
+        raise Refused('pipeline variables are unreadable; subscription is unknown')
+    labels = set()
+    for item in variables:
+        key, value = item.get('key', ''), item.get('value')
+        if value != 'true' or not key.startswith('GLA_DEPLOY_'):
+            continue
+        label = key.removeprefix('GLA_DEPLOY_').split('_', 1)[0].upper()
+        if label == 'ALL':
+            return 'other'
+        if label in {'PSC', 'LP', 'OCK'}:
+            labels.add(label)
+    return 'psc' if labels == {'PSC'} else 'other' if labels else 'none'
+
+
+class Gitlab:
+    def api(self, endpoint, method='GET', payload=None, raw=False):
+        command = [os.environ.get('GLAB_BIN', 'glab'), 'api', '--hostname', HOST,
+                   endpoint, '--method', method]
+        if payload is not None:
+            command += ['--header', 'Content-Type: application/json', '--input', '-']
+        try:
+            result = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
+                                    text=True, capture_output=True, timeout=45)
+        except subprocess.TimeoutExpired as exc:
+            raise Refused('GitLab request timed out; do not blindly replay a POST') from exc
+        if result.returncode:
+            raise Refused('GitLab request failed: ' + result.stderr.strip())
+        if raw:
+            return result.stdout
+        try:
+            return json.loads(result.stdout)
+        except ValueError as exc:
+            raise Refused('GitLab returned an unreadable response') from exc
+
+
+def timestamp(value):
+    if not isinstance(value, str):
+        raise Refused('completed dyn-env job has no trustworthy finished_at')
+    try:
+        date = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if date.tzinfo is None:
+            raise ValueError('timezone missing')
+        return date.timestamp()
+    except ValueError as exc:
+        raise Refused('invalid dyn-env finished_at') from exc
+
+
+class Stand:
+    def __init__(self, root, forge=None, wait_seconds=180):
+        self.worktree = batch.Batch(root)
+        self.root = self.worktree.root
+        self.branch = self.worktree.branch
+        origin = batch.git(self.root, 'remote', 'get-url', 'origin').removesuffix('.git')
+        if origin not in {'git@' + HOST + ':common/frontend/frontend', WEB}:
+            raise Refused('automatic PSC stands are limited to the configured p2p GitLab project')
+        self.forge = forge if forge is not None else Gitlab()
+        self.wait_seconds = wait_seconds
+        self.directory = self.root / '.superpowers/stand'
+        self.state_path = self.directory / 'state.json'
+
+    def plan(self):
+        self.worktree.stable()
+        sha = self.worktree.head()
+        base = batch.git(self.root, 'merge-base', 'origin/dev', sha)
+        # --no-renames reports both sides of a move; deleted base paths remain visible.
+        raw = subprocess.check_output(['git', '-C', str(self.root), 'diff', '--name-only',
+                                       '--no-renames', '-z', base, sha])
+        paths = [path for path in raw.decode().split('\0') if path]
+        selected = impact(paths)
+        eligible = self.branch.startswith(PREFIX)
+        return {'status': 'planned' if eligible else 'ineligible', 'project': 40,
+                'branch': self.branch, 'sha': sha, 'base': base, 'wl': 'psc',
+                'eligible': eligible, 'paths': paths, **selected,
+                'variables': deploy_variables(selected['roles']) if selected['roles'] else [],
+                'stand_health_verified': False}
+
+    def result(self, plan, status, pipeline=None):
+        return {**plan, 'status': status, 'pipeline_id': pipeline['id'] if pipeline else None,
+                'pipeline_url': pipeline.get('web_url') if pipeline else None}
+
+    @contextmanager
+    def lock(self):
+        for path in (self.root / '.superpowers', self.directory, self.state_path):
+            if path.is_symlink():
+                raise Refused('stand state must not be a symlink: ' + str(path))
+        if subprocess.run(['git', '-C', str(self.root), 'check-ignore', '-q',
+                           '.superpowers/stand/state.json']).returncode:
+            raise Refused('stand receipts must be locally ignored and untracked')
+        self.directory.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.directory / 'lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'a') as file:
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise Refused('another stand command owns this worktree') from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(file, fcntl.LOCK_UN)
+
+    def receipt(self):
+        if not self.state_path.exists():
+            return None
+        try:
+            state = json.loads(self.state_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise Refused('stand receipt is unreadable; no automatic replay') from exc
+        if (not isinstance(state, dict) or state.get('branch') != self.branch
+                or state.get('phase') not in {'creating', 'pending'}
+                or not isinstance(state.get('sha'), str)
+                or not isinstance(state.get('roles'), list)):
+            raise Refused('stand receipt does not belong to this request')
+        return state
+
+    def save(self, state):
+        with tempfile.NamedTemporaryFile(mode='w', dir=self.directory, delete=False) as file:
+            temporary = Path(file.name)
+            try:
+                json.dump(state, file, sort_keys=True)
+                file.write('\n')
+                file.flush()
+                os.fsync(file.fileno())
+                os.replace(temporary, self.state_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def verify_remote(self, plan):
+        self.worktree.stable()
+        if self.worktree.head() != plan['sha']:
+            raise Refused('local HEAD changed during publication')
+        branch = self.forge.api(PROJECT + '/repository/branches/' + quote(self.branch, safe=''))
+        if (not isinstance(branch, dict) or branch.get('name') != self.branch
+                or not isinstance(branch.get('commit'), dict)
+                or branch['commit'].get('id') != plan['sha']):
+            raise Refused('remote SHA differs from the authorized local HEAD')
+
+    def pipelines(self, source, sha=None):
+        query = {'ref': self.branch, 'source': source, 'per_page': 100}
+        if sha:
+            query['sha'] = sha
+        rows = self.forge.api(PROJECT + '/pipelines?' + urlencode(query))
+        if (not isinstance(rows, list) or any(not isinstance(row, dict)
+                or type(row.get('id')) is not int or row['id'] <= 0 for row in rows)):
+            raise Refused('GitLab pipeline listing is unreadable')
+        return [row for row in rows if row.get('ref') == self.branch and row.get('source') == source
+                and (not sha or row.get('sha') == sha)]
+
+    def jobs(self, pipeline):
+        jobs = self.forge.api(PROJECT + f'/pipelines/{pipeline["id"]}/jobs?per_page=100')
+        if (not isinstance(jobs, list) or any(not isinstance(job, dict)
+                or type(job.get('id')) is not int or job['id'] <= 0 for job in jobs)):
+            raise Refused('GitLab job listing is unreadable')
+        return jobs
+
+    def observed_push(self, plan):
+        deadline = time.monotonic() + self.wait_seconds
+        while True:
+            for pipeline in self.pipelines('push', plan['sha']):
+                for job in self.jobs(pipeline):
+                    if job.get('name') != 'dyn-env state-check':
+                        continue
+                    if job.get('status') == 'success':
+                        trace = self.forge.api(PROJECT + f'/jobs/{job["id"]}/trace', raw=True)
+                        return trace_state(trace), timestamp(job.get('finished_at')), pipeline
+                    if job.get('status') in {'failed', 'canceled', 'skipped', 'manual'}:
+                        raise Refused('native dyn-env state-check did not succeed; subscription is unknown')
+            if time.monotonic() >= deadline:
+                raise Refused('native dyn-env state-check is not ready; no subscription API was created')
+            time.sleep(min(3, max(0, deadline - time.monotonic())))
+
+    def subscription_events(self, observed_at):
+        events = []
+        pending = []
+        for source in ('api', 'web'):
+            rows = self.pipelines(source)
+            # A truncated history cannot prove that an old manual job did not mutate the subscription.
+            if len(rows) >= 100:
+                raise Refused('subscription history exceeds the bounded inspection; state is unknown')
+            for pipeline in rows:
+                for job in self.jobs(pipeline):
+                    name, status = job.get('name'), job.get('status')
+                    if name not in {'dyn-env subscribe-and-deploy', 'dyn-env stop'}:
+                        continue
+                    if name == 'dyn-env subscribe-and-deploy' and status == 'skipped':
+                        if (pipeline.get('sha') == self.worktree.head()
+                                and pipeline.get('status') in {'failed', 'canceled'}):
+                            raise Refused('subscription pipeline checks failed; do not automatically retry')
+                        continue
+                    if name == 'dyn-env stop' and status in {'manual', 'created', 'skipped', 'canceled'}:
+                        continue
+                    if status in {'success', 'failed', 'canceled'}:
+                        finished = timestamp(job.get('finished_at'))
+                        if finished <= observed_at:
+                            continue
+                        if status != 'success':
+                            raise Refused('a newer dyn-env mutation failed; do not automatically resubscribe')
+                        if name == 'dyn-env stop':
+                            events.append((finished, 'none', pipeline))
+                        else:
+                            trace = self.forge.api(PROJECT + f'/jobs/{job["id"]}/trace', raw=True)
+                            if 'subscribe is a no-op' in trace:
+                                continue
+                            events.append((finished, trace_state(trace), pipeline))
+                    else:
+                        if name == 'dyn-env stop':
+                            raise Refused('a stop job is active; no automatic resubscription')
+                        variables = self.forge.api(PROJECT + f'/pipelines/{pipeline["id"]}/variables')
+                        selected = variable_state(variables)
+                        if selected == 'other':
+                            raise Refused('a non-PSC subscription is pending; do not replace its WL')
+                        if selected == 'psc':
+                            pending.append(pipeline)
+        return sorted(events, key=lambda item: item[0]), pending
+
+    def ensure(self):
+        self.worktree.clean()
+        plan = self.plan()
+        if not plan['eligible']:
+            return self.result(plan, 'ineligible')
+        if not plan['roles']:
+            return self.result(plan, 'not-needed')
+        with self.lock():
+            receipt = self.receipt()
+            self.verify_remote(plan)
+            state, observed_at, native_pipeline = self.observed_push(plan)
+            if state not in {'none', 'psc'}:
+                raise Refused('subscription is non-PSC or unknown; no subscribe API was created')
+            events, pending = self.subscription_events(observed_at)
+            pipeline = native_pipeline
+            if events:
+                _, state, pipeline = events[-1]
+            if state not in {'none', 'psc'}:
+                raise Refused('a newer subscription is non-PSC or unknown; no subscribe API was created')
+            if pending:
+                return self.result(plan, 'subscription-pending', pending[0])
+            if state == 'psc':
+                return self.result(plan, 'psc-reused', pipeline)
+            if receipt:
+                raise Refused('previous subscription request is unresolved or stopped; no automatic replay')
+            self.verify_remote(plan)
+            intent = {'branch': self.branch, 'sha': plan['sha'], 'roles': plan['roles'],
+                      'phase': 'creating', 'pipeline_id': None}
+            self.save(intent)  # Persist before POST: timeout/crash must not issue a duplicate request.
+            created = self.forge.api(PROJECT + '/pipeline', method='POST',
+                                     payload={'ref': self.branch, 'variables': plan['variables']})
+            if (not isinstance(created, dict) or type(created.get('id')) is not int
+                    or created['id'] <= 0 or created.get('sha') != plan['sha']
+                    or created.get('ref') != self.branch or created.get('source') != 'api'):
+                raise Refused('API pipeline identity differs from the published request; inspect before retrying')
+            intent.update(phase='pending', pipeline_id=created['id'])
+            self.save(intent)
+            self.verify_remote(plan)
+            return self.result(plan, 'subscription-requested', created)
+
+
+def publish(root, args):
+    subject = Stand(root)
+    worktree = subject.worktree
+    if len(args) != 2 or args[0].startswith('-') or args[1] != subject.branch:
+        raise Refused('usage: wt push -- <configured-remote> <current-task-branch>; no force/multiple refspecs')
+    remote, branch = args
+    worktree.stable()
+    worktree.clean()
+    batch.git(subject.root, 'remote', 'get-url', '--push', remote)
+    if worktree.marker.exists() or worktree.marker.is_symlink():
+        command = [sys.executable, str(HERE / 'batch'), 'push', '--', remote, branch]
+    else:
+        # Keep ordinary native hooks; never manufacture or bypass a batch proof.
+        for name in ('push.followTags', 'remote.' + remote + '.mirror'):
+            result = subprocess.run(['git', '-C', str(subject.root), 'config', '--bool', '--get', name],
+                                    text=True, capture_output=True)
+            if result.returncode not in (0, 1) or result.stdout.strip() == 'true':
+                raise Refused('push config broadens the authorized refs: ' + name)
+        result = subprocess.run(['git', '-C', str(subject.root), 'config', '--get', 'push.recurseSubmodules'],
+                                text=True, capture_output=True)
+        if result.returncode not in (0, 1) or result.stdout.strip() not in {'', 'no', 'false'}:
+            raise Refused('recursive submodule publication is outside this flow')
+        command = ['git', 'push', remote, f'refs/heads/{branch}:refs/heads/{branch}']
+        hook = Path(batch.git(subject.root, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks')) / 'pre-push'
+        if hook.is_file() and os.access(hook, os.X_OK):
+            command = [str(batch.GUARD), '--wait', '60', '--exclusive-key', str(subject.root), '--', *command]
+    plan = subject.plan()
+    result = subprocess.run(command, cwd=subject.root, text=True, capture_output=True)
+    for output in (result.stdout, result.stderr):
+        if output:
+            print(output, file=sys.stderr, end='' if output.endswith('\n') else '\n')
+    if result.returncode:
+        raise Refused('Git push failed; no subscription API was created')
+    if remote != 'origin' or not plan['eligible']:
+        return {**subject.result(plan, 'publication-only'), 'push_succeeded': True}
+    push_url = batch.git(subject.root, 'remote', 'get-url', '--push', remote).removesuffix('.git')
+    if push_url not in {'git@' + HOST + ':common/frontend/frontend', WEB}:
+        raise Refused('push succeeded, but remote is not the PSC GitLab project', published=True)
+    try:
+        ensured = subject.ensure()
+    except (Refused, batch.Refused, OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise Refused('push succeeded; automatic stand blocked: ' + str(exc), published=True) from exc
+    return {**ensured, 'push_succeeded': True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--plan', action='store_true', help='read-only committed diff and PSC role selection')
+    modes.add_argument('--ensure', action='store_true', help='bootstrap PSC only from successful empty-state evidence')
+    parser.add_argument('--wait', type=int, default=180, help='bounded native state-check wait, 0..600 seconds')
+    parser.add_argument('command', nargs='?', choices=['push'])
+    parser.add_argument('args', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if not 0 <= args.wait <= 600:
+        parser.error('--wait must be between 0 and 600')
+    if args.command and (args.plan or args.ensure):
+        parser.error('push cannot be combined with --plan/--ensure')
+    if args.command:
+        result = publish(Path.cwd(), args.args)
+    else:
+        subject = Stand(Path.cwd(), wait_seconds=args.wait)
+        result = subject.ensure() if args.ensure else subject.plan()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (Refused, batch.Refused, OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(json.dumps({'status': 'refused', 'reason': str(exc),
+                          'push_succeeded': getattr(exc, 'published', False),
+                          'stand_health_verified': False}, ensure_ascii=False))
+        raise SystemExit(1)
