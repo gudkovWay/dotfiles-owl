@@ -20,8 +20,7 @@ hl.config({
         mouse_move_enables_dpms = false,
         key_press_enables_dpms = false,
         middle_click_paste = false,
-        enable_swallow = true,
-        swallow_regex = "(kitty|ghostty|[Kk]onsole|Alacritty|gnome-terminal|xfce[0-9]?-terminal)",
+        enable_swallow = false,
         vrr = 3,
     },
     xwayland = {
