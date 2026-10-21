@@ -1,6 +1,6 @@
 ---
 name: starting-worktree-work
-description: Use when choosing a new working branch in any repository; when starting any feature, project, or hotfix work, or any change to feature/project/hotfix code; when a linked worktree may already exist or an integration DEV-* branch is occupied by a live agent; when the current worktree has uncommitted changes; when writing p2p Nuxt env overrides; when creating a GitLab MR via wt mr or glab; when basing a branch on a release tag.
+description: Use when choosing a new working branch in any repository; when starting any feature, project, or hotfix work, or any change to feature/project/hotfix code; when publishing a p2p DEV branch or planning its automatic Payscrow stand; when synchronizing branches before commit, push, or MR delivery, including pull, rebase, or a non-fast-forward rejection; when a linked worktree may already exist or an integration DEV-* branch is occupied by a live agent; when the current worktree has uncommitted changes; when writing p2p Nuxt env overrides; when creating a GitLab MR via wt mr or glab; when basing a branch on a release tag.
 ---
 
 # Worktree-first вход в работу
@@ -112,6 +112,43 @@ JSON, ручной `cd` не нужен. `-x omp` (свежий OMP владее
 - Если перенос рискует потерять контекст владения — запусти свежий OMP в новом worktree или скоординируйся с владельцем.
 - Никогда не создавай WIP-коммит искусственно и не выполняй `git stash` / `reset` / `clean` в worktree другого агента.
 
+## 5a. Git-синхронизация: rebase рабочих веток
+
+Политика действует во всех репозиториях владельца. Обновление рабочей ветки
+из её базы и доставка в integration target — разные операции.
+
+1. **До синхронизации:** установи текущую ветку, разрешённую базу и владение
+   worktree; дерево должно быть чистым. Не прячь изменения через auto-stash.
+   Проверь актуальный remote ref рабочей ветки: отсутствие upstream или
+   устаревший remote-tracking ref не доказывает, что коммиты не опубликованы.
+2. **Неопубликованные коммиты задачи:** синхронизируй через rebase без нового
+   вопроса. Для p2p в owned task-worktree: `git fetch origin dev` →
+   `git rebase origin/dev`; эквивалент — `git pull origin dev --rebase`.
+   В остальных репозиториях используй разрешённую базу, не подставляй `dev`.
+3. **Опубликованная feature/task-ветка:** rebase допустим только после
+   отдельного разрешения переписать именно эту ветку. Обычное «commit/push
+   to dev» такого разрешения не даёт. Уже полученный апрув того же rewrite
+   scope не спрашивай повторно; общую ветку или работу другого владельца
+   автоматически не переписывай.
+4. **Push после разрешённого rebase:** заранее сохрани проверенный SHA
+   исходного remote ref. Если нужен non-fast-forward push, используй только
+   `--force-with-lease=refs/heads/<task>:<old-sha>`, не `--force`. Отказ lease
+   означает, что remote изменился: исследуй новые коммиты, не обновляй lease
+   вслепую и не затирай чужую работу. Авторизация доставки остаётся отдельной.
+5. **Общая integration-ветка (`dev`, `main`, release):** обновляй локальный
+   checkout только fast-forward: для p2p `git pull --ff-only origin dev`.
+   При расхождении истории остановись; не rebase/reset/force-push общего ref.
+6. **Не заменяй rebase merge-коммитом синхронизации:** не выполняй
+   `git merge origin/dev`, `git pull --no-rebase` или `rebase --rebase-merges`
+   ради сохранения SHA задачи. Исключение — явный запрос владельца на merge
+   для этой синхронизации; назови исключение. Уже доставленные merge-коммиты
+   в общем target не удаляй и не переписывай ради линейности.
+7. **После rebase:** разреши конфликты с сохранением согласованного поведения,
+   повтори релевантные проверки на итоговом состоянии; новый SHA требует
+   нового CI-доказательства. Если база снова продвинулась, повтори этот
+   порядок, а не добавляй merge-коммит. MR/CI/cleanup-контракт §7 сохраняется;
+   integration merge по разрешённому workflow не является merge базы в task.
+
 ## 6. p2p Nuxt: env-контракт
 
 Для p2p каскадных приложений записывай игнорируемый `apps/<app>/.env`
@@ -139,13 +176,190 @@ ecom поддерживает `admin-ui`, его тестовый контрак
 дереве не требует нового install/prepare. `wt deps -- --dry-run` не мутирует.
 Ни shared writable `.nuxt`/`node_modules`, ни reflink-обхода после ошибки.
 
+Разрешённый p2p dev/UI запуск выполняй через `wt dev -- --app=payscrow-admin`
+или `wt ui -- --app payscrow-admin`: они сами проверяют готовность,
+переиспользуют актуальные outputs или выполняют недостающие audited
+install/targeted prepare в одном guarded/exclusive scope. Полный production
+build не является prerequisite для Nuxt dev. Merchant/provider выбираются
+своим приложением; Lucky/OCK этим не включаются. Никаких голых npm ci/dev,
+shared writable outputs, resource retries или вопросов на каждый штатный шаг.
+Для минимальных DEV test-account grants — процедура `p2p DEV permissions`
+в `skill://repository-testing`, не глобальное редактирование пермишена.
+
+## 6b. p2p commit: обычный режим и явная партия
+
+Коммиты и доставка требуют отдельной авторизации. Разные темы — разные
+коммиты с явным стейджингом файлов темы, но не разные worktree.
+Для нескольких атомарных коммитов выбирай batch: явный begin на чистом
+дереве до правок. Одиночный коммит остаётся в обычном строгом режиме.
+
+**Обычный режим:** до коммита проверяй `wt commit -- --check`, затем используй
+`wt commit -- -m "<message>"`. Обёртка готовит лишь missing/stale prerequisites
+и запускает реальные hooks в guarded scope. Профиль `commit` требует generated
+ESLint-конфиг Payscrow admin, который root ESLint импортирует даже для слоёв;
+`admin-tests` его не готовит.
+
+**Batch — только после проверенной установки новых алиасов:** в чистом owned
+linked task-worktree явно начни `wt batch -- begin --base origin/dev`.
+Обычный `wt commit -- -m "<message>"` внутри партии откладывает только
+проверенный lint-staged pre-commit, не запускает install/prepare и сохраняет
+остальные Git hooks. Неизвестные pre-commit/init-проверки блокируют этот режим.
+Не используй глобальный `HUSKY=0`, `--no-verify` или общий `core.hooksPath`.
+
+После всех коммитов выполни `wt batch -- verify`: один serial прогон текущих
+lint-staged-задач по cumulative diff от pinned merge-base до HEAD, с адресной
+подготовкой окружения в общем guarded/exclusive scope. Он проверяет итог партии,
+не каждый промежуточный снимок. `wt batch -- status` показывает состояние.
+
+Если успешный autofix вернул `needs-commit`, инспектируй исправления и коммить
+по темам. Ничего автоматически не стейджи/не переписывай. Затем
+`wt batch -- check` дешёво подтверждает точное совпадение committed tree с
+проверенным содержимым. Новое содержимое, конфигурация или environment требуют
+нового verify; rebase/движение базы — чистого дерева, явного
+`wt batch -- begin --base origin/dev --refresh` и нового cumulative verify.
+Refresh сам по себе не разрешает rebase или rewrite опубликованной ветки.
+
+Доставка обычного и batch-режима: `wt push -- origin <current-task-branch>`,
+затем `wt mr`. Зарегистрированный batch всегда требует current receipt:
+обычный режим не является fallback при missing/stale proof или удалённом
+локальном state. Успешная публикация завершает deferred-режим независимо
+от последующего статуса автоматического стенда; свидетельство хранится для MR.
+Прямой `git push` обходит PSC-автоматику и для штатной доставки не используется.
+
+Native tests, обязательный local typecheck, UI-доказательство и CI актуального
+MR SHA — независимые требования. Hooks/autofix, изменившие их входы, требуют
+повторить затронутые проверки на итоговом содержимом. Зелёные hooks не разрешают
+merge при незавершённом/красном CI. Ошибка/OOM/timeout не создаёт proof и не
+разрешает обход caps, lockfile-правки или доставку. Классификация — no-autotests §7.
+
+## 6c. p2p: автоматический PSC-стенд после разрешённого push
+
+Исполнитель: `/home/q/.config/worktrunk/projects/p2p-frontend/stand`.
+Перед публикацией можно прочитать выбор через `wt stand -- --plan`: это
+committed diff от merge-base с `origin/dev`, не только последний commit.
+Helper выбирает PSC-роли по слоям/приложениям; common runtime и корневые
+зависимости затрагивают четыре PSC-роли. Docs/test-only/CI-only не требуют
+нового стенда. Lucky и exchange-only изменения не выдаются за проверку PSC;
+они перечисляются в `unsupported`.
+
+- Автоматика действует только в owned linked `DEV-capitalism-slave-*`
+  worktree проекта `gitlab.psclp.org/common/frontend/frontend` и после
+  уже разрешённого `wt push -- origin <branch>`. Она не даёт нового
+  разрешения на commit/push, prod или другие проекты.
+- После публикации helper сверяет remote SHA и ждёт успешный нативный
+  `dyn-env state-check` (до 180s). Только его явное сообщение об отсутствии
+  подписок допускает первоначальный API-запуск с нужными `GLA_DEPLOY_PSC_*`.
+  Все поддерживаемые ALL/LP/OCK-флаги выключены; `CI_PIPELINE_SOURCE` не подменяется.
+- Подтверждённый `psc` переиспользуется: дальнейшие push уже обновляют
+  подписанный WL существующим `state-check`. Дополнительный API pipeline
+  после каждого push и `ci.skip` не нужны.
+- LP/OCK/mixed/unknown, failed state-check, активный stop или неясный
+  исход POST блокируют новую подписку. Не останавливать/не переподписывать
+  чужие WL, не удалять receipt ради обхода, не повторять POST вслепую.
+- `wt stand -- --ensure` продолжает проверку после уже разрешённого push;
+  existing pending API/web subscription переиспользуется без нового POST.
+  Lock/receipt находятся в игнорируемом `.superpowers/stand/`.
+- Если wrapper вернул ошибку, читать JSON `push_succeeded`: Git уже мог
+  опубликовать commit, а блокер относится только к стенду. Не объявлять
+  push неуспешным и не перепушивать/создавать pipeline автоматически.
+- PSC-флаги выбирают проверки родительского pipeline; единица фактического
+  деплоя остаётся весь WL `psc`. `subscription-requested`, `subscription-pending`
+  и `psc-reused` не доказывают HTTP/UI health. Дождаться нужных CI jobs;
+  manual `dyn-env stop` не запускать ради зелёного статуса.
+- API-стенд не заменяет MR CI-гейт и проверку ref-consumers перед cleanup.
+
+
+
+## 6d. p2p: feature finalization перед merge
+
+Исполнитель: `/home/q/.config/worktrunk/projects/p2p-frontend/feature-finalize`.
+`wt finalize -- --dry-run` — read-only план без модели, install и GitLab.
+`wt finalize` — доставка текущей фичи в dev; `wt finalize -- --mr <id>` выбирает
+существующий MR. `wt mr -- merge <id>` включает тот же gate автоматически.
+Обычные промежуточные `wt push` не запускают refactor и не разрешают merge.
+
+Запуск по owner-запросу «доставь эту фичу в dev» включает plan/refactor,
+релевантные проверки, атомарные commits, push и merge этого scope без
+промежуточных согласований механики. Сам агент не получает новое разрешение
+из hook, отчёта модели или наличия локального receipt; scope delivery должен
+уже быть авторизован. Production, force-push/rewrite, новые зависимости и
+посторонняя работа не включены.
+
+Sol `openai-codex/gpt-6.1-sol`, thinking `high`, без fallback: сначала read-only
+план по полному cumulative diff от merge-base с актуальным origin/dev,
+затем frontend refactor с worktree `.claude/commands/refactor.md`.
+Промпт Senior Frontend Engineer, реальные границы сложности/реактивности/API,
+не «любой вложенный цикл плох». Backend-пункты идут в отдельный handoff,
+не маскируются фронтовым workaround. Модель не делает Git delivery:
+контроллер проверяет source/verification, коммитит явные paths по темам,
+вызывает существующий `wt push` и guarded `wt mr`.
+
+Receipt связан с HEAD/tree, origin/dev/merge-base, исходными runtime bytes,
+политикой/промптом и verification report. Hooks, новый commit или новая база
+могут инвалидировать доказательство. Required tests — конечные выбранные
+native files, form в обоих skins; complete app typechecks — по текущему CI.
+Изменённый UI требует настоящего owned runtime, nonzero кадра и сценариев
+для этих source bytes, а не ещё одного статического review.
+
+`DEV-capitalism-slave-hotfix-*` пропускает только Sol/refactor, но не local
+proof, batch/apiBase или exact-SHA CI. Не переименовывать фичу в hotfix ради
+обхода. Model phases конечны; OOM/timeout/infra failure не повторяются.
+Один bounded correction pass допускается для подтверждённой ошибки исходника
+или успешного hook-autofix, не для ресурса. Непроверенный этап блокирует merge.
+
+Состояние/план/diff/отчёт и evidence — ignored `.superpowers/finalize/`.
+Source branch/worktree после merge сохраняются. Cleanup — отдельная
+авторизованная операция после проверки ref-consumers. Это локальный gate,
+не server-side защита GitLab web UI.
+
 ## 7. MR: GitLab p2p
 
 - p2p-интеграция — только GitLab MR; `wt merge` для p2p не предписывать.
 - `wt mr ...` перед делегированием `glab mr ...` обязан проверить diff apiBase
   против `origin/dev` (guard). Напрямую `glab` без guard — обход защиты, нельзя.
 - GitLab MR не может целиться в тег — MR только в ветку (`dev` / DEV-*).
-- CI-гейт в этом скилле отсутствует.
+- До merge обязателен CI-гейт актуального MR SHA ниже; зелёный локальный
+  typecheck не заменяет проверку доставляемого коммита на стороне CI.
+
+### CI перед merge и cleanup
+
+Этот порядок действует при доставке в репозитории с CI, не только в p2p.
+Он не даёт нового разрешения на commit/push/merge, изменение GitLab-проекта,
+запуск дополнительных pipeline или отмену чужих jobs.
+
+1. До доставки выполни релевантные native tests и обязательный локальный
+   typecheck по `skill://repository-testing`. Если hooks изменили проверенные
+   входы, повтори затронутые проверки на итоговом состоянии.
+2. После авторизованного push получи актуальный MR SHA и соответствующий
+   pipeline через read-only GitLab API/CLI. По текущему CI-контракту проверь
+   наличие и успех всех обязательных jobs/вариантов, включая typecheck.
+   Зелёный старый SHA, пустой набор jobs, missing/skipped/canceled проверки
+   не закрывают gate; optional/manual jobs определяются контрактом, не догадкой.
+3. Running/pending CI ожидай сам без вопроса «можно ли дождаться?», с конечным
+   deadline и умеренным интервалом API-запросов. Если ожидание истекло,
+   сохрани ветку/MR и назови pending delivery; не объявляй задачу доставленной.
+   Ошибку типов/assertion или исправимый дефект исходника/тестовой конфигурации
+   расследуй, исправь в согласованном scope и повтори локальные проверки без
+   нового апрува. Push исправления — только в уже авторизованном delivery scope;
+   новый SHA требует нового CI-доказательства. Инфраструктурный сбой — блокер,
+   а не разрешение на слепые CI retries, новые зависимости или обход caps.
+4. Непосредственно перед merge снова сверь MR SHA, pipeline и обязательные jobs.
+   Не вызывай немедленный merge при незавершённом/красном CI. Native auto-merge
+   допустим лишь при доказанном server-side CI-гейте и безопасном cleanup.
+   В p2p на 2026-10-09 `only_allow_merge_if_pipeline_succeeds=false`:
+   не рассчитывай на серверный барьер без новой проверки настройки.
+5. Source branch нельзя удалять, пока pipeline/jobs, использующие её ref,
+   ещё могут выполнять checkout: проверь также branch/child pipelines,
+   pending/running/delayed jobs и ожидающие запуска обязательные manual jobs.
+   Успех MR pipeline сам по себе не доказывает завершение branch pipeline.
+   Установленный p2p wrapper сохраняет source при merge. Отдельный
+   `wt mr -- cleanup <id>` заново проверяет потребителей до удаления.
+   Не обходи `wt mr`/guard прямым `glab`; если безопасный порядок недоступен
+   или статус неизвестен, сохрани branch/worktree и назови блокер.
+6. После merge проверь присутствие доставленных коммитов в согласованном target.
+   В отчёте раздели local tests, local typecheck, CI pipeline/SHA/jobs,
+   merge/target и cleanup; ни push, ни локальный exit 0 не означают доставку.
+
 
 ### Доставка всей согласованной задачи
 
@@ -168,7 +382,10 @@ ecom поддерживает `admin-ui`, его тестовый контрак
 | Worktree занят live-агентом | handoff/reuse, не дублировать |
 | Грязный анкер | оставить нетронутым; при риске — свежий OMP или координация |
 | p2p env | `apps/<app>/.env` с api stand URL — только Payscrow LK (admin, merchant, provider) |
-| MR | `wt mr` (guard apiBase) → `glab mr` |
+| MR | `wt mr` (apiBase + feature receipt + exact-SHA CI) → pinned `glab mr` |
+| Выбор PSC-приложений по committed diff | `wt stand -- --plan` (read-only) |
+| Продолжить PSC bootstrap после разрешённой публикации | `wt stand -- --ensure` |
+| Доставка фичи в dev | `wt finalize` (только в авторизованном scope) |
 
 ## Решения
 
@@ -189,7 +406,10 @@ ecom поддерживает `admin-ui`, его тестовый контрак
 
 | Дата | Запись |
 |---|---|
-| 2026-10-08 | Reuse по связанной задаче, полный delivery scope; backend независим от frontend branch; готовность/подготовка через guarded профили. [OVERSIZE: 202 lines - ownership, branch/env и MR-контракт должны читаться вместе] |
+| 2026-10-21 | p2p `wt finalize` / `wt mr merge`: feature-only Sol 6.1 high plan/refactor, native local checks, content-bound receipt и exact-SHA CI. Source сохраняется; cleanup отдельный. Dev/UI готовят missing prerequisites сами; DEV grants — по repository-testing. [OVERSIZE: 424 lines - ownership, synchronization, environment, publication and pre-merge delivery gates belong to one workflow] |
+| 2026-10-14 | `wt push` обслуживает ordinary/batch публикацию и подключает только PSC после доказанного empty state-check. Приложения определяются по committed diff; существующая WL-гранулярность dyn-env сохранена. |
+| 2026-10-09 | Закреплены rebase рабочих веток, ff-only обновление общего checkout и отдельный апрув опубликованного rewrite с точным force-with-lease. CI-гейт, cleanup и commit-readiness сохранены. |
+| 2026-10-08 | Reuse по связанной задаче, полный delivery scope; backend независим от frontend branch; готовность/подготовка через guarded профили. |
 | 2026-10-04 | Именование новых веток вынесено в глобальный branch-naming. Разделены продолжение и независимая задача; посторонние DEV-ветки не создают approval gate. |
 | 2026-09-29 | Уточнён бизнес-процесс: branch-стендовые env-override (`NUXT_PUBLIC_API_BASE`) — только для Payscrow LK приложений (admin, merchant, provider). `payscrow-form` работает через другой form-gateway контракт (`NUXT_PUBLIC_API_URL`/`WS_URL`/`REDIRECT_URL`) и override не получает. Lucky по умолчанию не провижнится в linked worktree/branch-стендах — проверяется на общем dev-стенде после merge и только по запросу. OCK выведен из эксплуатации, setup не получает. Тот же список зашит в pre-start хуке Worktrunk (`~/.config/worktrunk/projects/p2p-frontend/pre-start-env`). |
 | 2026-09-29 | Зафиксировано, что создание/переиспользование linked worktree остаётся дешёвым: для правки не ставятся зависимости и не запускается `nuxt prepare`; материализация зависимостей — только явное on-demand действие (профили репозиториев упомянуты концептуально, их конфиги — вне этого скилла). Добавлен раздел 6a; hotfix-быстрый путь из `rule://delegation-pipeline` опирается на этот штатный вход. |
@@ -200,3 +420,5 @@ ecom поддерживает `admin-ui`, его тестовый контрак
 
 - 2026-09-14 (найдено 09-15): «Таже сессия: … затем пользователь `/wt <branch>` переносит live session» — модель честно ждала человека, 3 остановки за день. Правило меняло поведение не в ту сторону: способность агента работать через абсолютный путь не зависит от якоря сессии. Заменено агентским путём; старый запрет «НЕ редактируй код, пока пользователь не выполнит `/wt`» удалён как вредоносный.
 - 2026-10-04: в p2p-сессиях создавались `agent/inter-app-font` и `agent/shadcn-label-regular` после чтения этого скилла: он описывал базу и переиспользование DEV-веток, но не именование новых. Теперь перед выбором имени загружается единая глобальная политика.
+- 2026-10-09, session `01a12075-9146-77c9-9234-438fb572aab9`: MR был merged до завершения typecheck, затем раннее удаление source branch сломало checkout branch pipeline. Локальные тесты, CI merge-gate и безопасность cleanup — разные обязательства.
+- 2026-10-09, sessions `01a12119-b235` и `01a12126-fe6c`: рабочие ветки синхронизировались через локальные merge-коммиты «merge dev before delivery». Fast-forward режим GitLab не запрещает такие коммиты внутри task-ветки. Для синхронизации теперь используется §5a; опубликованный rewrite требует отдельного разрешения.
