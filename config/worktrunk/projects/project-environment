@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from resource_guard import reserve_environment
 
 HERE = Path(__file__).resolve().parent
 GUARD = HERE / 'guarded-run'
@@ -54,20 +55,53 @@ def dependencies_key(root):
     return h.hexdigest()
 
 
-def profile_commands(repo, profile):
-    if profile == 'admin-tests':
-        if repo != 'p2p':
-            fail('ecom has no verified admin test entrypoint; do not borrow p2p test:admin')
-        return [['npm', 'run', 'prepare:common'], ['npm', 'run', 'prepare:admin']]
-    return [['npm', 'run', 'prepare:common'], ['npm', 'run', 'prepare:admin'],
-            ['npm', 'exec', '--offline', '--', 'nuxt', 'prepare', '--cwd', 'apps/payscrow-admin']]
+def profile_steps(repo, profile):
+    if profile not in {'common-tests', 'admin-tests', 'form-tests', 'merchant-tests', 'provider-tests',
+                       'admin-ui', 'merchant-ui', 'provider-ui', 'commit'}:
+        fail('unknown environment profile: ' + profile)
+    if repo != 'p2p' and profile != 'admin-ui':
+        fail('only the ecom admin-ui entrypoint is reviewed')
+    role = profile.rsplit('-', 1)[0] if profile != 'commit' else 'admin'
+    app = 'apps/payscrow-' + role
+    steps = [('lib/common-layer', ['npm', 'run', 'prepare:common'], ['tsconfig.json'])]
+    if role != 'common':
+        steps.append(('lib/' + role + '-layer', ['npm', 'run', 'prepare:' + role], ['tsconfig.json']))
+    if not profile.endswith('-tests'):
+        steps.append((app,
+                      ['npm', 'exec', '--offline', '--', 'nuxt', 'prepare', '--cwd', app],
+                      ['tsconfig.json', 'eslint.config.mjs'] if repo == 'p2p' else ['tsconfig.json']))
+    return steps
 
 
-def generated_key(root, profile, depkey):
+def commit_contract(root):
+    # The root linter imports the admin app's generated config, even for layer files.
+    config = (root / 'eslint.config.mjs').read_text()
+    imports = re.findall(r'(?:from\s*|import\s*)["\']([^"\']+)["\']', config)
+    generated = [name for name in imports if '.nuxt/' in name]
+    if generated != ['./apps/payscrow-admin/.nuxt/eslint.config.mjs']:
+        fail('root ESLint generated imports changed; review commit prerequisites')
+    package = read_json(root / 'package.json')
+    scripts = package.get('scripts', {})
+    for name, command in {'prepare:common': 'nuxt prepare --cwd lib/common-layer',
+                          'prepare:admin': 'nuxt prepare --cwd lib/admin-layer'}.items():
+        if scripts.get(name) != command:
+            fail('commit prepare script changed; review: ' + name)
+    tasks = package.get('lint-staged', {})
+    if not any('eslint --fix' in (value if isinstance(value, list) else [value])
+               for value in tasks.values()):
+        fail('root lint-staged ESLint contract changed; review commit profile')
+    if 'npx lint-staged --allow-empty' not in (root / '.husky/pre-commit').read_text().splitlines():
+        fail('pre-commit entrypoint changed; review commit profile')
+
+
+def generated_key(root, directory, depkey):
     h = hashlib.sha256(depkey.encode())
-    dirs = ['lib/common-layer', 'lib/admin-layer']
-    if profile == 'admin-ui':
-        dirs.append('apps/payscrow-admin')
+    dirs = ['lib/common-layer']
+    if directory != 'lib/common-layer':
+        role = directory.removeprefix('apps/payscrow-') if directory.startswith('apps/payscrow-') else Path(directory).name.removesuffix('-layer')
+        dirs.append('lib/' + role + '-layer')
+    if directory.startswith('apps/'):
+        dirs.append(directory)
     for directory in dirs:
         base = root / directory
         for current, directories, files in os.walk(base):
@@ -103,25 +137,56 @@ def workspace_links_ready(root):
     return True
 
 
-def ready(root, profile, key):
+def step_status(root, steps, key):
+    results = []
+    for directory, command, outputs in steps:
+        targets = [directory + '/.nuxt/' + name for name in outputs]
+        stamp = root / '.superpowers/environment' / (Path(directory).name + '.json')
+        current_key = generated_key(root, directory, key)
+        metadata = read_json(stamp) if stamp.exists() else {}
+        current = (metadata.get('schema') == 3 and metadata.get('key') == current_key
+                   and all((root / target).is_file() for target in targets))
+        results.append({'root': directory, 'command': command, 'outputs': targets,
+                        'key': current_key, 'ready': current, 'stamp': stamp})
+    return results
+
+
+def ready(root, profile, key, repo='p2p'):
     dep_stamp = root / 'node_modules/.omp-environment.json'
     metadata = read_json(dep_stamp) if dep_stamp.exists() else {}
     issue = runtime_issue(root)
     deps = (metadata.get('schema') == 2 and metadata.get('key') == key and
             metadata.get('native_profile') == 'nuxt-admin' and workspace_links_ready(root))
-    stamp = root / '.superpowers/environment' / (profile + '.json')
-    targets = ['lib/common-layer/.nuxt/tsconfig.json', 'lib/admin-layer/.nuxt/tsconfig.json']
-    if profile == 'admin-ui':
-        targets.append('apps/payscrow-admin/.nuxt/tsconfig.json')
-    generated = deps and stamp.exists() and read_json(stamp).get('key') == generated_key(root, profile, key) and all((root / p).is_file() for p in targets)
+    commands = profile_steps(repo, profile)
+    if profile == 'commit':
+        commit_contract(root)
+    steps = step_status(root, commands, key)
+    generated = deps and all(step['ready'] for step in steps)
     return {'dependencies': 'ready' if deps else ('unverified' if (root / 'node_modules').exists() else 'missing'),
-            'generated': 'ready' if generated else 'missing-or-stale', 'required_generated': targets,
+            'generated': 'ready' if generated else 'missing-or-stale',
+            'required_generated': [target for step in steps for target in step['outputs']],
+            'prepare_commands': [step['command'] for step in steps],
+            'pending_prepare': [step['command'] for step in steps if not deps or not step['ready']],
             'runtime_warning': issue, 'dependency_scope': 'nuxt-admin; SQLite native lifecycle is not needed by these profiles'}
 
 
-def guard_owned():
-    if 'omp-heavy-job.scope' not in Path('/proc/self/cgroup').read_text():
-        fail('internal execution requires the guarded scope')
+def prepare(root, repo, profile, key):
+    commands = profile_steps(repo, profile)
+    if profile == 'commit':
+        commit_contract(root)
+    steps = step_status(root, commands, key)
+    state_dir = root / '.superpowers/environment'
+    state_dir.mkdir(parents=True, exist_ok=True)
+    for step in steps:
+        if step['ready']:
+            continue
+        # A failed/replaced prepare must never leave an earlier success stamp.
+        step['stamp'].unlink(missing_ok=True)
+        native(root, step['command'])
+        missing = [target for target in step['outputs'] if not (root / target).is_file()]
+        if missing:
+            fail('prepare exited successfully but required output is missing: ' + ', '.join(missing))
+        step['stamp'].write_text(json.dumps({'schema': 3, 'key': step['key']}) + '\n')
 
 
 def nuxtrc_snapshot(root):
@@ -222,7 +287,9 @@ def install(root, key):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--profile', choices=['admin-ui', 'admin-tests'], default='admin-ui')
+    p.add_argument('--profile', choices=['admin-ui', 'merchant-ui', 'provider-ui', 'common-tests',
+                                        'admin-tests', 'form-tests', 'merchant-tests', 'provider-tests', 'commit'],
+                   default='admin-ui')
     p.add_argument('--install', action='store_true')
     p.add_argument('--prepare', action='store_true')
     p.add_argument('--dry-run', action='store_true')
@@ -233,25 +300,31 @@ def main():
     repo = identity(root)
     if any((root / name).exists() for name in ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb']):
         fail('non-npm lockfile present; refusing manager substitution')
-    for location in ['node_modules', 'lib/common-layer/.nuxt', 'lib/admin-layer/.nuxt', 'apps/payscrow-admin/.nuxt']:
+    steps = profile_steps(repo, args.profile)
+    directories = [step[0] for step in steps]
+    for location in ['node_modules', *(directory + '/.nuxt' for directory in directories)]:
         if (root / location).is_symlink():
             fail('shared writable dependency/generated path is not an owned environment: ' + location)
-    for directory in ['lib/common-layer', 'lib/admin-layer', 'apps/payscrow-admin']:
+    for directory in directories:
         config = root / directory / 'nuxt.config.ts'
         if config.exists() and '@nuxt/content' in config.read_text():
-            fail('admin profile now enables content/SQLite; review its native requirements rather than skipping that lifecycle')
+            fail('selected profile now enables content/SQLite; review its native requirements rather than skipping that lifecycle')
+    if not args.dry_run and (args.install or args.prepare):
+        if not args.inside:
+            forwarded = [a for a in sys.argv[1:] if a != '--dry-run']
+            os.execv(str(GUARD), [str(GUARD), '--need', '3G', '--wait', '60', '--exclusive-key', str(root),
+                                 '--', sys.executable, str(Path(__file__).resolve()), '--inside', *forwarded])
+        # Claim before reading stamps: another job may be writing them now.
+        reserve_environment(root)
     key = dependencies_key(root)
-    commands = profile_commands(repo, args.profile)
-    status = ready(root, args.profile, key)
+    status = ready(root, args.profile, key, repo=repo)
+    runner = ('npm run test:' + args.profile.removesuffix('-tests') + ' -- <files>' if args.profile.endswith('-tests')
+              else 'wt commit -- <git commit args>' if args.profile == 'commit'
+              else 'npm run dev -w payscrow-' + args.profile.removesuffix('-ui'))
     print(json.dumps({'repository': repo, 'root': str(root), 'profile': args.profile, **status,
-                     'install_needed': status['dependencies'] != 'ready',
-                     'prepare_commands': commands, 'runner': 'npm run test:admin -- <files>' if args.profile == 'admin-tests' else 'npm run dev -w payscrow-admin'}, ensure_ascii=False), flush=True)
+                     'install_needed': status['dependencies'] != 'ready', 'runner': runner}, ensure_ascii=False), flush=True)
     if args.dry_run or not (args.install or args.prepare):
         return
-    if not args.inside:
-        forwarded = [a for a in sys.argv[1:] if a != '--dry-run']
-        os.execv(str(GUARD), [str(GUARD), '--', sys.executable, str(Path(__file__).resolve()), '--inside', *forwarded])
-    guard_owned()
     if subprocess.run(['git', 'check-ignore', '-q', '.superpowers/environment/probe']).returncode:
         fail('.superpowers must be locally ignored before storing environment state')
     state_dir = root / '.superpowers/environment'
@@ -259,20 +332,15 @@ def main():
     if args.install and status['dependencies'] != 'ready':
         install(root, key)
     if args.prepare:
-        status = ready(root, args.profile, key)
+        status = ready(root, args.profile, key, repo=repo)
         if status['dependencies'] != 'ready':
             fail('dependencies are missing/unverified; use --install explicitly if needed')
-        if status['generated'] != 'ready':
-            stamp = state_dir / (args.profile + '.json')
-            current_key = generated_key(root, args.profile, key)
-            source_current = stamp.exists() and read_json(stamp).get('key') == current_key
-            for command, target in zip(commands, status['required_generated'], strict=True):
-                if not source_current or not (root / target).is_file():
-                    native(root, command)
-            missing = [target for target in status['required_generated'] if not (root / target).is_file()]
-            if missing:
-                fail('prepare exited successfully but required output is missing: ' + ', '.join(missing))
-            stamp.write_text(json.dumps({'key': current_key}) + '\n')
+        prepare(root, repo, args.profile, key)
+    status = ready(root, args.profile, key, repo=repo)
+    if args.prepare and status['generated'] != 'ready':
+        fail('generated prerequisites changed during preparation; no automatic retry')
+    print(json.dumps({'repository': repo, 'root': str(root), 'profile': args.profile, **status},
+                     ensure_ascii=False), flush=True)
     print('project-environment: requested prerequisites ready')
 
 
@@ -281,4 +349,4 @@ if __name__ == '__main__':
         main()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print('project-environment: refusing: ' + str(error), file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(getattr(error, 'code', 1))

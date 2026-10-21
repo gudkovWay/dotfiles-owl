@@ -8,16 +8,69 @@ from pathlib import Path
 import shutil
 import signal
 import re
+import stat
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
+from resource_guard import assert_guarded
+from dev_support import ensure_environment
 
 HERE = Path(__file__).resolve().parent
 GUARD = HERE / 'guarded-run'
 ENVIRONMENT = HERE / 'project-environment'
+APPS = ('payscrow-admin', 'payscrow-merchant', 'payscrow-provider')
+
+
+def authentication(repository, app, home):
+    """Describe the UI login contract without returning credential values."""
+    if app not in APPS:
+        raise RuntimeError('unsupported UI application')
+    if repository != 'p2p':
+        return {'state': 'not-configured'}
+    directory = home / '.secrets'
+    path = directory / app
+    result = {
+        'credentials_file': str(path), 'format': 'login on line 1; password on line 2',
+        'username_selector': '#username', 'password_selector': '#password',
+        'submit_role': 'button', 'submit_name': 'Войти',
+        'permissions_procedure': '/home/q/.omp/agent/skills/repository-testing/SKILL.md#p2p-dev-permissions',
+        'flow': 'Attach only the owned CDP endpoint. Read credentials locally without printing them; '
+                'fill username and password, click Войти once, wait for authenticated navigation '
+                'and the target screen. Never record passwords, cookies, tokens or auth request bodies. '
+                'If 2FA is required, report that prerequisite; do not bypass it. '
+                'A ready file is not proof of successful login or screen verification.',
+    }
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        return {**result, 'state': 'missing'}
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise RuntimeError('UI secrets directory must be owned by this user, not a symlink, mode 0700')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {**result, 'state': 'missing'}
+    except OSError:
+        raise RuntimeError('cannot safely open UI credentials file: ' + str(path)) from None
+    with os.fdopen(fd, 'rb') as stream:
+        metadata = os.fstat(stream.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise RuntimeError('UI credentials file must be user-owned regular file, mode 0600: ' + str(path))
+        data = stream.read(16385)
+    if len(data) > 16384:
+        raise RuntimeError('UI credentials file exceeds 16 KiB: ' + str(path))
+    try:
+        lines = data.decode('utf-8').splitlines()
+    except UnicodeDecodeError:
+        raise RuntimeError('UI credentials file must be UTF-8: ' + str(path)) from None
+    if not data or all(not line for line in lines):
+        return {**result, 'state': 'empty'}
+    if len(lines) != 2 or not all(lines):
+        raise RuntimeError('UI credentials file needs exactly two nonempty lines: ' + str(path))
+    return {**result, 'state': 'ready'}
 
 
 def git(*args):
@@ -110,6 +163,8 @@ def interrupted(_signum, _frame):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--seconds', type=int, default=480)
+    p.add_argument('--app', choices=APPS, default='payscrow-admin',
+                   help='select app and ~/.secrets/<app> two-line login/password file; login is performed via owned CDP')
     p.add_argument('--port', type=int, default=3000)
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--capture', action='store_true', help='one-shot unauthenticated entry-page screenshot and DOM; not protected-screen verification')
@@ -119,20 +174,24 @@ def main():
         p.error('seconds must be 30..540; port must be 1..65535')
     root = Path(git('rev-parse', '--show-toplevel')).resolve()
     os.chdir(root)
-    command = [sys.executable, str(Path(__file__).resolve()), '--inside', '--seconds', str(args.seconds), '--port', str(args.port)]
+    profile = args.app.removeprefix('payscrow-') + '-ui'
+    command = [sys.executable, str(Path(__file__).resolve()), '--inside', '--seconds', str(args.seconds), '--port', str(args.port), '--app', args.app]
     if args.capture:
         command.append('--capture')
     if args.dry_run:
-        subprocess.run([str(ENVIRONMENT), '--profile', 'admin-ui'], check=True)
-        subprocess.run([str(GUARD), '--dry-run', '--', *command], check=True)
+        status = json.loads(subprocess.check_output([str(ENVIRONMENT), '--profile', profile], text=True))
+        print(json.dumps({'app': args.app, 'authentication': authentication(status['repository'], args.app, Path.home())}, ensure_ascii=False), flush=True)
+        subprocess.run([str(GUARD), '--dry-run', '--need', '6G', '--wait', '60',
+                        '--exclusive-key', str(root), '--', *command], check=True)
         return
     if not args.inside:
-        os.execv(str(GUARD), [str(GUARD), '--', *command])
-    if 'omp-heavy-job.scope' not in Path('/proc/self/cgroup').read_text():
-        raise RuntimeError('internal entry requires the guarded scope')
-    status = json.loads(subprocess.check_output([str(ENVIRONMENT), '--profile', 'admin-ui'], text=True))
-    if status['dependencies'] != 'ready' or status['generated'] != 'ready':
-        raise RuntimeError('environment not ready: ' + json.dumps(status, ensure_ascii=False))
+        os.execv(str(GUARD), [str(GUARD), '--need', '6G', '--wait', '60',
+                            '--exclusive-key', str(root), '--', *command])
+    assert_guarded()
+    # Check external prerequisites before installing anything. Preparation and
+    # server/browser share the admitted scope and its exclusive worktree key.
+    status = json.loads(subprocess.check_output([str(ENVIRONMENT), '--profile', profile], text=True))
+    auth = authentication(status['repository'], args.app, Path.home())
     chromium = shutil.which('chromium')
     if not chromium or not shutil.which('dbus-run-session'):
         raise RuntimeError('installed Chromium and private dbus-run-session required; no automatic install')
@@ -147,6 +206,9 @@ def main():
         raise RuntimeError('worktree identity changed during initialization')
     if not git('rev-parse', '--git-common-dir') or (root / '.git').is_dir():
         raise RuntimeError('use an explicitly owned linked worktree, not the root checkout')
+    status = ensure_environment(profile, prepare=status['repository'] == 'p2p')
+    if status['dependencies'] != 'ready' or status['generated'] != 'ready':
+        raise RuntimeError('environment not ready: ' + json.dumps(status, ensure_ascii=False))
     port = args.port
     if not port_available(port):
         with socket.socket() as sock:
@@ -179,13 +241,14 @@ def main():
         # Backend CORS admits localhost, not the numerically equivalent 127.0.0.1.
         # Listener ownership is still proved against its actual 127.0.0.1 socket.
         url = f'http://localhost:{port}'
-        manifest = {'root': str(root), 'branch': branch, 'head': revision, 'app': 'payscrow-admin', 'repository': status['repository'],
+        manifest = {'root': str(root), 'branch': branch, 'head': revision, 'app': args.app, 'repository': status['repository'],
+                    'authentication': auth,
                     'source_diff_sha256': hashlib.sha256(subprocess.check_output(['git', 'diff', 'HEAD'])).hexdigest(),
                     'url': url, 'stop_file': str(stop_file), 'artifacts': str(artifacts), 'deadline_seconds': args.seconds,
                     'verification': 'not exercised; launcher readiness is not screen verification'}
         try:
             with (artifacts / 'server.log').open('w') as server_log, (artifacts / 'browser.log').open('w') as browser_log:
-                server = subprocess.Popen([*bus, 'npm', 'run', 'dev', '-w', 'payscrow-admin', '--', '--host', '127.0.0.1', '--port', str(port)], env=environment, stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
+                server = subprocess.Popen([*bus, 'npm', 'run', 'dev', '-w', args.app, '--', '--host', '127.0.0.1', '--port', str(port)], env=environment, stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
                 while True:
                     if server.poll() is not None:
                         raise RuntimeError(f'owned server exited ({server.returncode}); inspect server.log; no automatic retry')
@@ -255,4 +318,4 @@ if __name__ == '__main__':
         raise SystemExit(130)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print('ui-session: refusing: ' + str(error), file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(getattr(error, 'code', 1))
