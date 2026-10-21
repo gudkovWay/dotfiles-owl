@@ -35,5 +35,10 @@ root=$(git rev-parse --show-toplevel)
 }
 
 cd "$root"
-exec /home/q/.config/worktrunk/projects/guarded-run ${dry_run:+$dry_run} -- \
-	npm run dev -w "$app" -- --host 127.0.0.1 --port "$port"
+case "$(git remote get-url origin)" in
+	*ecom/frontend/frontend|*ecom/frontend/frontend.git)
+		# Preserve ecom's existing explicit-preparation contract.
+		exec /home/q/.config/worktrunk/projects/guarded-run ${dry_run:+$dry_run} -- \
+			npm run dev -w "$app" -- --host 127.0.0.1 --port "$port" ;;
+esac
+exec /home/q/.config/worktrunk/projects/dev-session --app "$app" --port "$port" ${dry_run:+$dry_run}
