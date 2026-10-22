@@ -52,6 +52,10 @@ chmod 600 "$PRIVATE_ACCOUNT"
 RUNTIME_CACHE="$FAKE_CONFIG/worktrunk/projects/__pycache__/local.pyc"
 mkdir -p "$(dirname "$RUNTIME_CACHE")"
 printf 'local cache marker\n' >"$RUNTIME_CACHE"
+# A user's ordinary local rule must not be replaced by the protected integration.
+OWNER_RULE="$FAKE_HOME/.omp/agent/rules/owner-rule-authority.md"
+mkdir -p "$(dirname "$OWNER_RULE")"
+printf 'local owner policy\n' >"$OWNER_RULE"
 
 env -i HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_CONFIG" PATH="$STUB_BIN:$PATH" \
   bash "$REPO/install.sh" >/dev/null 2>&1 ||
@@ -151,5 +155,28 @@ env -i HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_CONFIG" PATH="$STUB_BIN:$PATH" \
   fail 'second installer invocation exited non-zero'
 [[ ! -L "$OWNER_SKILL" && "$(cat "$OWNER_SKILL")" == 'owner-specific workflow' ]] ||
   fail 'existing owner-edited workflow was overwritten on reinstall'
+[[ ! -L "$OWNER_RULE" && "$(cat "$OWNER_RULE")" == 'local owner policy' ]] ||
+  fail 'existing local owner rule was replaced'
+
+OWNER_EXTENSION="$FAKE_HOME/.omp/agent/extensions/owner-approval.js"
+if [[ -e "$REPO/omp/extensions/owner-approval.js" ]]; then
+  [[ -L "$OWNER_EXTENSION" && "$(readlink -f "$OWNER_EXTENSION")" == /usr/local/lib/omp-owner-approval/extension.js ]] ||
+    fail 'owner approval extension points to a mutable checkout instead of protected code'
+else
+  [[ ! -e "$OWNER_EXTENSION" && ! -L "$OWNER_EXTENSION" ]] ||
+    fail 'owner approval was enabled without an installed protected extension'
+fi
+
+rm "$OWNER_RULE"
+env -i HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_CONFIG" PATH="$STUB_BIN:$PATH" \
+  bash "$REPO/install.sh" >/dev/null 2>&1 ||
+  fail 'second isolated install exited non-zero'
+if [[ -e "$REPO/omp/rules/owner-rule-authority.md" ]]; then
+  [[ -L "$OWNER_RULE" && "$(readlink -f "$OWNER_RULE")" == /usr/local/lib/omp-owner-approval/owner-rule-authority.md ]] ||
+    fail 'owner authority rule points to a mutable checkout instead of protected policy'
+else
+  [[ ! -e "$OWNER_RULE" && ! -L "$OWNER_RULE" ]] ||
+    fail 'owner authority was enabled without an installed protected policy'
+fi
 
 printf 'OK (install-smoke): all install contract checks passed\n'

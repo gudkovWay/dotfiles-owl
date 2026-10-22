@@ -61,12 +61,21 @@ link claude/settings.json "$HOME/.claude/settings.json"
 link claude/CLAUDE.md     "$HOME/.claude/CLAUDE.md"
 link claude/hooks         "$HOME/.claude/hooks"
 
+# ── Тема курсора и совместимый Xcursor fallback ─────────────────────────────
+link local/share/icons/Dot-Dark "$HOME/.local/share/icons/Dot-Dark"
+link local/share/icons/Dot-Dark "$HOME/.icons/Dot-Dark"
+
 # ── OMP ────────────────────────────────────────────────────────────────────
 # Только отслеживаемые расширения и authored workflow-файлы. Базы, сессии,
 # receipts, provider config и секреты ~/.omp остаются локальными.
 link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
+link omp/extensions/prompt-card "$HOME/.omp/agent/extensions/prompt-card"
+link omp/extensions/image-links.ts "$HOME/.omp/agent/extensions/image-links.ts"
 link omp/extensions/jev-shadow.ts "$HOME/.omp/agent/extensions/jev-shadow.ts"
 link omp/herdr-local-files "$HOME/.local/share/omp/herdr-local-files"
+# Источник апрува — только установленная root-owned копия, не editable checkout.
+# До её явной установки эти ссылки пропускаются; парольный диалог здесь не открываем.
+link omp/extensions/owner-approval.js "$HOME/.omp/agent/extensions/owner-approval.js"
 while IFS= read -r -d '' f; do
   link "$f" "$HOME/.omp/agent/${f#omp/}"
 done < <(git -C "$REPO" ls-files -z -- omp/hooks omp/rules omp/skills omp/jev)
@@ -93,6 +102,11 @@ cat <<EOF
 Демон пробуждения ставится своим скриптом (заводит пользователя screenwake):
 
   sudo $REPO/config/hypr/scripts/wake-on-space-daemon/install.sh
+
+Канал подтверждённых исключений OMP (отдельный системный парольный диалог):
+
+  python3 "$REPO/omp/owner-approval/setup.py"
+  bash "$REPO/install.sh"
 
 Включить пользовательские юниты:
 

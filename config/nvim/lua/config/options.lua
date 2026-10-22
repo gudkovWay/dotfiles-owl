@@ -54,9 +54,8 @@ if vim.fn.executable("rg") == 1 then
   opt.grepformat = "%f:%l:%c:%m"
 end
 
--- подсветка невидимых символов
-opt.list = true
-opt.listchars = { tab = "→ ", trail = "·", nbsp = "␣" }
+-- невидимые символы не отображаются
+opt.list = false
 
 -- статус-лайн без плагина (модуль config.statusline)
 opt.statusline = "%!v:lua.require('config.statusline').render()"

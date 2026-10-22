@@ -1,0 +1,1 @@
+/usr/local/lib/omp-owner-approval/owner-rule-authority.md
