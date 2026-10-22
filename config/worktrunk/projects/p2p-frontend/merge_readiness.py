@@ -131,7 +131,14 @@ def wait_for_ci(root, iid, branch, sha, required, seconds=600):
             raise RuntimeError(f'CI pipeline {current["id"]}: {current.get("status")}; no automatic retry')
         if time.monotonic() >= deadline:
             raise RuntimeError('CI still pending/missing at deadline; preserve branch and MR')
-        print('feature-finalize: waiting for current-SHA MR CI', flush=True)
+        if current:
+            jobs = forge.pages(f'projects/:id/pipelines/{current["id"]}/jobs?include_retried=false')
+            pending = ', '.join(f'{job["name"]}={job["status"]}' for job in jobs
+                                if job.get('status') != 'success' and job.get('allow_failure') is not True)
+            print(f'feature-finalize: CI {current["id"]} {sha[:12]} {current["status"]}; '
+                  f'{current.get("web_url", "")}; pending: {pending or "awaiting required jobs/downstream"}', flush=True)
+        else:
+            print(f'feature-finalize: MR !{iid} awaiting pipeline for {sha[:12]}', flush=True)
         time.sleep(min(10, max(0, deadline - time.monotonic())))
 
 
@@ -143,7 +150,7 @@ def merge_args(iid, sha):
 
 
 def assert_ref_idle(root, branch):
-    """Only explicit cleanup uses this; ordinary merges preserve the source ref."""
+    """Prove every branch/downstream ref consumer idle before post-merge deletion."""
     forge = Forge(root)
     for pipeline in forge.pages('projects/:id/pipelines?ref=' + quote(branch, safe='')):
         if pipeline.get('status') in ACTIVE:
