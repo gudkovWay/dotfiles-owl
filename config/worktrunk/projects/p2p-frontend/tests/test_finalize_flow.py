@@ -119,6 +119,37 @@ class FinalizationFlowTests(unittest.TestCase):
         self.assertFalse((self.root / '.superpowers/finalize/receipt.json').exists())
         self.assertEqual(self.git('status', '--porcelain'), '')
 
+    def test_owner_opt_out_still_requires_native_proof_and_records_no_sol(self):
+        current = f.snapshot(self.root)
+        path = f.directory(self.root)
+        manifest = path / 'owner-manifest.json'
+        manifest.write_text(json.dumps({'commits': [], 'tests': [], 'fixed': [], 'backend': [],
+                                        'warnings': [], 'blockers': [], 'ui': {'required': False}}))
+        with patch.object(f, 'verify_local', return_value={'source': current, 'checks': []}) as verify:
+            f.owner_opt_out(self.root, current, path, manifest, 'owner: skip Sol for this task')
+            verify.assert_called_once()
+        receipt = json.loads((path / 'receipt.json').read_text())
+        proof = json.loads(Path(receipt['verification']).read_text())
+        self.assertEqual(proof['sol']['status'], 'not-run')
+        self.assertTrue(f.current_receipt(self.root))
+        (self.root / 'a.ts').write_text('new source')
+        self.assertFalse(f.current_receipt(self.root, f.snapshot(self.root, allow_dirty=True)))
+
+    def test_skip_sol_without_explicit_reason_or_manifest_is_refused(self):
+        for reason, manifest in ((None, None), (' ', None), ('skip', None)):
+            with self.assertRaisesRegex(RuntimeError, 'requires'):
+                f.owner_opt_out(self.root, f.snapshot(self.root), f.directory(self.root), manifest, reason)
+
+    def test_failed_opt_out_verification_does_not_create_receipt(self):
+        path = f.directory(self.root)
+        manifest = path / 'owner-manifest.json'
+        manifest.write_text(json.dumps({'commits': [], 'tests': [], 'fixed': [], 'backend': [],
+                                        'warnings': [], 'blockers': [], 'ui': {'required': False}}))
+        with patch.object(f, 'verify_local', side_effect=RuntimeError('native checks failed')):
+            with self.assertRaisesRegex(RuntimeError, 'native checks failed'):
+                f.owner_opt_out(self.root, f.snapshot(self.root), path, manifest, 'skip Sol')
+        self.assertFalse((path / 'receipt.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

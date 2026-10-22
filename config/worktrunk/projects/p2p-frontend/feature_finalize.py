@@ -145,13 +145,15 @@ def refresh(root):
 
 
 def agent_command(root, inputs, plan):
-    tools = 'read,glob,grep' if plan else 'read,glob,grep,edit,write,bash,todo,browser,python'
-    return ['omp', '--print', '--model=' + MODEL, '--thinking=high', '--no-prewalk',
+    tools = 'read,glob,grep' if plan else 'read,glob,grep,edit,write,bash,todo,eval'
+    return ['omp', '--print', '--model=' + MODEL, '--thinking=high', '--service-tier=priority', '--no-prewalk',
             '--no-extensions', '--no-title', '--no-lsp', '--auto-approve', '--max-time=' + str(MODEL_SECONDS),
             '--cwd=' + str(root), '--tools=' + tools, *('@' + str(path) for path in inputs)]
 
 
 def run_agent(root, inputs, output, plan):
+    phase = 'plan' if plan else 'refactor'
+    print(f'feature-finalize: Sol {phase} starting (high, priority); log: {output}', flush=True)
     command = [str(GUARD), '--need', '2G' if plan else '6G', '--wait', '60',
                '--exclusive-key', str(root), '--', *agent_command(root, inputs, plan)]
     with output.open('w') as log:
@@ -160,6 +162,7 @@ def run_agent(root, inputs, output, plan):
         raise RuntimeError(f'Sol phase exited {result.returncode}; no automatic retry; evidence: {output}')
     if output.stat().st_size == 0:
         raise RuntimeError('Sol returned no output; no completion proof: ' + str(output))
+    print(f'feature-finalize: Sol {phase} complete; log: {output}', flush=True)
 
 
 def changed_paths(root):
@@ -370,15 +373,36 @@ def find_mr(root, branch, iid=None):
     return values[0] if values else None
 
 
-def finish(root, iid=None, dry_run=False):
+def owner_opt_out(root, current, path, manifest_path, reason):
+    if not reason or not reason.strip() or manifest_path is None:
+        raise RuntimeError('--skip-sol requires the owner opt-out reason and --manifest with native test/UI selections')
+    manifest = json.loads(Path(manifest_path).read_text())
+    validate_manifest(root, manifest, [])
+    run = path / ('owner-opt-out-' + str(time.time_ns()))
+    run.mkdir(mode=0o700)
+    save(run / 'implementation.json', manifest)
+    key = policy_key(root)
+    proof = verify_local(root, current, manifest, run)
+    if snapshot(root) != current or policy_key(root) != key:
+        raise RuntimeError('inputs changed during owner opt-out verification; no stale receipt')
+    proof['sol'] = {'status': 'not-run', 'owner_opt_out': reason.strip()}
+    (run / 'report.md').write_text(render_report(root, manifest, proof) +
+                                  '\nSol: NOT RUN; explicit owner opt-out: ' + reason.strip() + '\n')
+    save(run / 'verification.json', proof)
+    save(path / 'receipt.json', receipt_for(current, key, run / 'verification.json'))
+
+
+def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, manifest=None, reason=None):
     root = owned_root(root)
     initial = snapshot(root)
     if dry_run:
         print(json.dumps({'branch': initial['branch'], 'source': initial, 'hotfix': hotfix(initial['branch']),
-                          'model': MODEL, 'thinking': 'high', 'current_receipt': current_receipt(root, initial),
+                          'model': MODEL, 'thinking': 'high', 'service_tier': 'priority',
+                          'skip_sol': skip_sol, 'keep_source_branch': keep_source,
+                          'current_receipt': current_receipt(root, initial),
                           'required_ci': sorted(ci_requirements(root, initial)),
                           'plan_command': agent_command(root, [], True),
-                          'delivery': 'wt push -> exact-SHA MR CI -> wt mr merge; source preserved'}, ensure_ascii=False))
+                          'delivery': 'wt push -> exact-SHA MR CI -> merge -> safe remote cleanup; local worktree preserved'}, ensure_ascii=False))
         return 0
     path = directory(root)
     with lock(path):
@@ -391,9 +415,9 @@ def finish(root, iid=None, dry_run=False):
             validate_mr(mr, initial['branch'], mr['sha'])
             subprocess.run(['git', 'fetch', 'origin', 'refs/heads/' + initial['branch']], cwd=root, check=True)
             subprocess.run(['git', 'merge-base', '--is-ancestor', mr['sha'], initial['head']], cwd=root, check=True)
-        # Hotfixes skip Sol only; their author already owns local native proof.
-        # Exact-SHA CI and apiBase/batch gates still run through wt mr.
-        if not hotfix(initial['branch']) and not current_receipt(root, initial):
+        if skip_sol:
+            owner_opt_out(root, initial, path, manifest, reason)
+        if not current_receipt(root, initial):
             run = path / (str(time.time_ns()) + '-' + initial['head'][:12])
             run.mkdir(mode=0o700)
             inputs = feature_diff(root, initial)
@@ -461,7 +485,7 @@ def finish(root, iid=None, dry_run=False):
                 print('feature-finalize: refactor report: ' + str(run / 'report.md'), flush=True)
                 break
         current = snapshot(root)
-        if not hotfix(current['branch']) and not current_receipt(root, current):
+        if not current_receipt(root, current):
             raise RuntimeError('no current feature review receipt; merge is blocked')
         subprocess.run(['wt', 'push', '--', 'origin', current['branch']], cwd=root, check=True)
         remote = git(root, 'ls-remote', '--heads', 'origin', 'refs/heads/' + current['branch']).split()
@@ -479,25 +503,30 @@ def finish(root, iid=None, dry_run=False):
         save(path / 'ci.json', ci)
         if snapshot(root) != current:
             raise RuntimeError('source/target changed before merge; review again')
-        subprocess.run(['wt', 'mr', '--', 'merge', str(mr['iid']), '--sha=' + current['head'], '--yes'], cwd=root, check=True)
+        subprocess.run(['wt', 'mr', '--', 'merge', str(mr['iid']), '--sha=' + current['head'], '--yes',
+                        *(['--keep-source-branch'] if keep_source else [])], cwd=root, check=True)
         merged = Forge(root).mr(mr['iid'])
         if merged.get('state') != 'merged' or merged.get('sha') != current['head']:
             raise RuntimeError('merge not confirmed for the reviewed MR SHA; source preserved')
         refresh(root)
         result_sha = merged.get('squash_commit_sha') or merged.get('merge_commit_sha') or current['head']
         subprocess.run(['git', 'merge-base', '--is-ancestor', result_sha, 'refs/remotes/origin/dev'], cwd=root, check=True)
+        remote_preserved = bool(git(root, 'ls-remote', '--heads', 'origin', 'refs/heads/' + current['branch']))
         save(path / 'delivery.json', {'state': 'merged', 'mr': merged['iid'], 'sha': current['head'],
                                      'target': 'dev', 'result_sha': result_sha, 'source_preserved': True,
-                                     'ci': ci, 'review_receipt': str(path / 'receipt.json') if not hotfix(current['branch']) else None})
-        if not hotfix(current['branch']):
+                                     'remote_source_preserved': remote_preserved,
+                                     'ci': ci, 'review_receipt': str(path / 'receipt.json')})
+        if current_receipt(root, current):
             receipt = json.loads((path / 'receipt.json').read_text())
             report = Path(receipt['verification']).parent / 'report.md'
             text = report.read_text().rsplit('## Доставка', 1)[0]
             report.write_text(text + '## Доставка\n\nMerged в `dev`: MR !' + str(merged['iid'])
                               + ', source SHA `' + current['head'] + '`, result `' + result_sha
-                              + '`. Exact-SHA CI подтверждён; source branch/worktree сохранены.\n')
+                              + '`. Exact-SHA CI подтверждён; local worktree сохранён. Remote source '
+                              + ('сохранён (opt-out или cleanup deferred).' if remote_preserved else 'удалён после проверки ref-consumers.') + '\n')
         print(json.dumps({'state': 'merged', 'target': 'dev', 'mr': merged['iid'], 'sha': current['head'],
-                          'report': str(path / 'delivery.json'), 'source_preserved': True}, ensure_ascii=False))
+                          'report': str(path / 'delivery.json'), 'local_source_preserved': True,
+                          'remote_source_preserved': remote_preserved}, ensure_ascii=False))
     return 0
 
 
@@ -506,12 +535,16 @@ def main():
     parser.add_argument('--mr', type=int)
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--source-key', action='store_true', help='read-only runtime source content fingerprint')
+    parser.add_argument('--keep-source-branch', action='store_true', help='preserve remote source after merge')
+    parser.add_argument('--skip-sol', action='store_true', help='only for an explicit owner opt-out; native checks still required')
+    parser.add_argument('--manifest', type=Path, help='native test/UI selections for --skip-sol')
+    parser.add_argument('--reason', help='verbatim owner reason/request to skip Sol')
     args = parser.parse_args()
     root = Path(git(Path.cwd(), 'rev-parse', '--show-toplevel'))
     if args.source_key:
         print(source_key(owned_root(root)))
         return 0
-    return finish(root, args.mr, args.dry_run)
+    return finish(root, args.mr, args.dry_run, args.keep_source_branch, args.skip_sol, args.manifest, args.reason)
 
 
 if __name__ == '__main__':

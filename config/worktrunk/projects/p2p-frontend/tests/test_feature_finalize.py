@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Finite native unittest: branch review and forge gates, no live LLM/forge."""
 import importlib
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -77,12 +79,14 @@ class BranchTests(unittest.TestCase):
         command = self.f.agent_command(self.root, [self.root / 'input.md'], plan=True)
         self.assertIn('--model=openai-codex/gpt-6.1-sol', command)
         self.assertIn('--thinking=high', command)
+        self.assertIn('--service-tier=priority', command)
         self.assertIn('--no-prewalk', command)
         self.assertIn('--no-extensions', command)
         tools = next(arg for arg in command if arg.startswith('--tools='))
         self.assertEqual(tools, '--tools=read,glob,grep')
         command = self.f.agent_command(self.root, [], plan=False)
         tools = next(arg for arg in command if arg.startswith('--tools='))
+        self.assertEqual(tools, '--tools=read,glob,grep,edit,write,bash,todo,eval')
         self.assertNotIn('task', tools)
         self.assertNotIn('ask', tools)
 
@@ -219,6 +223,31 @@ class CIGateTests(unittest.TestCase):
         self.assertIn('--sha=' + 'a' * 40, args)
         self.assertIn('--remove-source-branch=false', args)
         self.assertNotIn('--auto-merge', args)
+
+    def test_ci_wait_reports_current_pipeline_url_and_pending_jobs(self):
+        sha = 'a' * 40
+        branch = 'DEV-capitalism-slave-progress'
+        value = {'source_branch': branch, 'target_branch': 'dev', 'sha': sha,
+                 'state': 'opened', 'source_project_id': 1, 'target_project_id': 1}
+        count = 0
+        class FakeForge:
+            def mr(self, _iid):
+                return value
+            def pages(self, path):
+                nonlocal count
+                if path.endswith('/pipelines'):
+                    count += 1
+                    return [{'id': 12, 'sha': sha, 'status': 'running' if count == 1 else 'success',
+                             'web_url': 'https://forge.invalid/pipelines/12'}]
+                return [{'name': 'Typecheck · Admin', 'status': 'running', 'allow_failure': False}]
+        output = io.StringIO()
+        jobs = [{'id': 1, 'name': 'Typecheck · Admin', 'status': 'success', 'allow_failure': False}]
+        with patch.object(self.c, 'Forge', return_value=FakeForge()), patch.object(self.c, 'pipeline_jobs', return_value=jobs), patch.object(self.c.time, 'sleep'), redirect_stdout(output):
+            proof = self.c.wait_for_ci(Path('/fixture'), 42, branch, sha, {'Typecheck · Admin'})
+        self.assertIn('CI 12', output.getvalue())
+        self.assertIn('Typecheck · Admin=running', output.getvalue())
+        self.assertIn('https://forge.invalid/pipelines/12', output.getvalue())
+        self.assertEqual(proof['sha'], sha)
 
 
 if __name__ == '__main__':
