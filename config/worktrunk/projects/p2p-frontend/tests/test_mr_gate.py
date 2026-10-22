@@ -29,7 +29,8 @@ class MergeGateTests(unittest.TestCase):
                                                     'snapshot': self.current, 'current_receipt': True,
                                                     'ci_requirements': {'Typecheck · Admin'}}),
                                     (mr, {'git': str(self.root), 'view': self.delivered,
-                                          'require_batch_proof': None, 'wait_for_ci': {'sha': self.sha}})):
+                                          'require_batch_proof': None, 'wait_for_ci': {'sha': self.sha},
+                                          'cleanup_remote': {'state': 'deleted'}})):
             for name, result in replacement.items():
                 mocked = patch.object(target, name, return_value=result)
                 setattr(self, name + '_mock', mocked.start())
@@ -45,7 +46,7 @@ class MergeGateTests(unittest.TestCase):
         self.wait_for_ci_mock.assert_not_called()
         self.require_batch_proof_mock.assert_not_called()
 
-    def test_valid_receipt_waits_ci_and_pins_merge_without_cleanup(self):
+    def test_valid_receipt_waits_ci_pins_merge_then_cleans_remote(self):
         self.assertEqual(mr.merge_feature(self.opened, ['42']), 0)
         self.wait_for_ci_mock.assert_called_once()
         args = self.call.call_args.args[0]
@@ -53,15 +54,25 @@ class MergeGateTests(unittest.TestCase):
         self.assertIn('--remove-source-branch=false', args)
         self.assertIn('--auto-merge=false', args)
         self.assertEqual(self.call.call_count, 1)
+        self.cleanup_remote_mock.assert_called_once_with(self.delivered)
 
-    def test_hotfix_skips_sol_but_not_ci_or_batch(self):
+    def test_keep_source_branch_does_not_clean_remote(self):
+        self.assertEqual(mr.merge_feature(self.opened, ['42', '--keep-source-branch']), 0)
+        self.cleanup_remote_mock.assert_not_called()
+
+    def test_pending_cleanup_does_not_turn_confirmed_merge_into_failure(self):
+        self.cleanup_remote_mock.side_effect = RuntimeError('source ref still has active pipeline consumers')
+        self.assertEqual(mr.merge_feature(self.opened, ['42']), 0)
+        self.assertEqual(self.call.call_count, 1)
+
+    def test_hotfix_requires_review_unless_owner_explicitly_opts_out(self):
         self.current['branch'] = 'DEV-capitalism-slave-hotfix-one'
         self.opened['source_branch'] = self.current['branch']
+        self.current_receipt_mock.return_value = False
         mr.merge_feature(self.opened, ['42'])
-        self.current_receipt_mock.assert_not_called()
-        self.wait_for_ci_mock.assert_called_once()
-        self.require_batch_proof_mock.assert_called_once()
-        self.assertEqual(self.call.call_args.args[0][1:3], ['mr', 'merge'])
+        self.current_receipt_mock.assert_called_once()
+        self.wait_for_ci_mock.assert_not_called()
+        self.assertEqual(self.call.call_args.args[0][0], str(ROOT / 'feature-finalize'))
 
     def test_failed_ci_never_calls_merge(self):
         self.wait_for_ci_mock.side_effect = RuntimeError('mandatory typecheck failed')

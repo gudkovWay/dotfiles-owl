@@ -285,9 +285,11 @@ Helper выбирает PSC-роли по слоям/приложениям; com
 уже быть авторизован. Production, force-push/rewrite, новые зависимости и
 посторонняя работа не включены.
 
-Sol `openai-codex/gpt-6.1-sol`, thinking `high`, без fallback: сначала read-only
-план по полному cumulative diff от merge-base с актуальным origin/dev,
-затем frontend refactor с worktree `.claude/commands/refactor.md`.
+Штатный Sol-проход заранее разрешён владельцем по opt-out-контракту
+`rule://delegation-pipeline`; не спрашивать повторно о запуске. Sol
+`openai-codex/gpt-6.1-sol`, thinking `high`, native `priority` (`/fast`), без
+fallback: сначала read-only план полного cumulative diff от merge-base с
+актуальным origin/dev, затем frontend refactor с worktree `.claude/commands/refactor.md`.
 Промпт Senior Frontend Engineer, реальные границы сложности/реактивности/API,
 не «любой вложенный цикл плох». Backend-пункты идут в отдельный handoff,
 не маскируются фронтовым workaround. Модель не делает Git delivery:
@@ -301,16 +303,21 @@ native files, form в обоих skins; complete app typechecks — по тек�
 Изменённый UI требует настоящего owned runtime, nonzero кадра и сценариев
 для этих source bytes, а не ещё одного статического review.
 
-`DEV-capitalism-slave-hotfix-*` пропускает только Sol/refactor, но не local
-proof, batch/apiBase или exact-SHA CI. Не переименовывать фичу в hotfix ради
-обхода. Model phases конечны; OOM/timeout/infra failure не повторяются.
+Hotfix тоже проходит Sol по умолчанию. Только явный отказ владельца
+разрешает `wt finalize -- --skip-sol --reason '<отказ>' --manifest <json>`;
+manifest содержит finite native tests/UI proof, не пустую заглушку.
+Это не отключает local proof, batch/apiBase или exact-SHA CI.
+Model phases конечны; OOM/timeout/infra failure не повторяются.
 Один bounded correction pass допускается для подтверждённой ошибки исходника
 или успешного hook-autofix, не для ресурса. Непроверенный этап блокирует merge.
 
 Состояние/план/diff/отчёт и evidence — ignored `.superpowers/finalize/`.
-Source branch/worktree после merge сохраняются. Cleanup — отдельная
-авторизованная операция после проверки ref-consumers. Это локальный gate,
-не server-side защита GitLab web UI.
+Remote source branch после merge удаляется автоматически только после
+проверки ref-consumers и точного remote SHA, с compare-and-swap deletion.
+`--keep-source-branch` сохраняет её по просьбе владельца. Активные/неизвестные
+consumers дают `cleanup deferred`, отдельно от успешного merge. Local
+branch/worktree остаются для живой сессии; `wt mr -- cleanup <id>` завершает
+их удаление, когда дерево чисто и свободно. Это локальный gate, не защита GitLab UI.
 
 ## 7. MR: GitLab p2p
 
@@ -352,10 +359,11 @@ Source branch/worktree после merge сохраняются. Cleanup — от
    ещё могут выполнять checkout: проверь также branch/child pipelines,
    pending/running/delayed jobs и ожидающие запуска обязательные manual jobs.
    Успех MR pipeline сам по себе не доказывает завершение branch pipeline.
-   Установленный p2p wrapper сохраняет source при merge. Отдельный
-   `wt mr -- cleanup <id>` заново проверяет потребителей до удаления.
-   Не обходи `wt mr`/guard прямым `glab`; если безопасный порядок недоступен
-   или статус неизвестен, сохрани branch/worktree и назови блокер.
+   Wrapper запрещает server-side delete в самой команде merge, затем сам
+   удаляет remote source после проверки потребителей. Неизвестный/активный
+   consumer сохраняет ref; `wt mr -- cleanup <id>` заново проверяет его
+   и завершает local cleanup. Не обходи guard прямым glab; назови конкретный
+   cleanup blocker, отдельно от подтверждённой доставки.
 6. После merge проверь присутствие доставленных коммитов в согласованном target.
    В отчёте раздели local tests, local typecheck, CI pipeline/SHA/jobs,
    merge/target и cleanup; ни push, ни локальный exit 0 не означают доставку.
@@ -406,7 +414,7 @@ Source branch/worktree после merge сохраняются. Cleanup — от
 
 | Дата | Запись |
 |---|---|
-| 2026-10-21 | p2p `wt finalize` / `wt mr merge`: feature-only Sol 6.1 high plan/refactor, native local checks, content-bound receipt и exact-SHA CI. Source сохраняется; cleanup отдельный. Dev/UI готовят missing prerequisites сами; DEV grants — по repository-testing. [OVERSIZE: 424 lines - ownership, synchronization, environment, publication and pre-merge delivery gates belong to one workflow] |
+| 2026-10-22 | Sol high/priority по opt-out, eval вместо несуществующих browser/python tools; remote cleanup после idle consumers по умолчанию, local tree сохраняется. UI redesign требует reference/before/after по frontend-design-flow. [OVERSIZE: delivery, synchronization and lifecycle form one workflow] |
 | 2026-10-14 | `wt push` обслуживает ordinary/batch публикацию и подключает только PSC после доказанного empty state-check. Приложения определяются по committed diff; существующая WL-гранулярность dyn-env сохранена. |
 | 2026-10-09 | Закреплены rebase рабочих веток, ff-only обновление общего checkout и отдельный апрув опубликованного rewrite с точным force-with-lease. CI-гейт, cleanup и commit-readiness сохранены. |
 | 2026-10-08 | Reuse по связанной задаче, полный delivery scope; backend независим от frontend branch; готовность/подготовка через guarded профили. |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guarded GitLab MR delivery to dev; source cleanup is a separate explicit action."""
+"""Guarded GitLab MR delivery to dev; delete the remote source only after ref consumers finish."""
 import json
 import os
 from pathlib import Path
@@ -204,6 +204,28 @@ def source_details(mr):
     return branch, sha
 
 
+def cleanup_remote(mr):
+    if mr.get('target_branch') != 'dev' or mr.get('state') != 'merged' or not mr.get('merged_at'):
+        raise ValueError('remote cleanup requires a confirmed merge into dev')
+    branch, sha = source_details(mr)
+    primary = Path(worktrees()[0]['worktree'])
+    git('fetch', 'origin', 'dev', cwd=primary)
+    proof = mr.get('squash_commit_sha') or mr.get('merge_commit_sha') or sha
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', proof):
+        raise ValueError('MR result SHA is missing or invalid')
+    git('merge-base', '--is-ancestor', proof, 'refs/remotes/origin/dev', cwd=primary)
+    ref = f'refs/heads/{branch}'
+    remote = git('ls-remote', '--heads', 'origin', ref, cwd=primary)
+    if remote:
+        if remote.split()[0] != sha:
+            raise Deferred('remote source advanced after merge; new work preserved')
+        assert_ref_idle(primary, branch)
+        git('push', f'--force-with-lease={ref}:{sha}', 'origin', f':{ref}', cwd=primary)
+    if git('ls-remote', '--heads', 'origin', ref, cwd=primary):
+        raise Deferred('remote source was recreated during cleanup; new work preserved')
+    return {'state': 'deleted', 'branch': branch, 'local': 'preserved; use wt mr cleanup when idle'}
+
+
 def cleanup(mr):
     if mr.get('target_branch') != 'dev':
         raise ValueError('cleanup is only allowed for a merge into dev')
@@ -216,24 +238,10 @@ def cleanup(mr):
     matches = check_local(branch, sha, trees)
     if matches and Path(matches[0]['worktree']) == primary:
         raise Deferred('source is the primary checkout; switch it before cleanup')
-    assert_ref_idle(primary, branch)
-    # The wrapper may have been invoked inside the source being removed.
+    cleanup_remote(mr)
     os.chdir(primary)
     git('fetch', '--prune', 'origin', cwd=primary)
-    # Rebase/squash can replace the source SHA. GitLab identifies the result
-    # commit; Worktrunk still independently checks integration before deletion.
-    proof = mr.get('squash_commit_sha') or mr.get('merge_commit_sha') or sha
-    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', proof):
-        raise ValueError('MR result SHA is missing or invalid')
-    git('merge-base', '--is-ancestor', proof, 'refs/remotes/origin/dev', cwd=primary)
     ref = f'refs/heads/{branch}'
-    remote = git('ls-remote', '--heads', 'origin', ref, cwd=primary)
-    if remote:
-        if remote.split()[0] != sha:
-            raise ValueError('remote source advanced after merge; source preserved')
-        # Compare-and-swap: a simultaneous push must not be erased.
-        git('push', f'--force-with-lease={ref}:{sha}', 'origin', f':{ref}', cwd=primary)
-        git('fetch', '--prune', 'origin', cwd=primary)
     matches = check_local(branch, sha, worktrees())
     if local_tip(branch) is None and not matches:
         run([sys.executable, str(Path(__file__).resolve().parent / 'batch'),
@@ -269,9 +277,10 @@ def merge_feature(mr, args):
         raise ValueError('requested merge SHA differs from current source')
     if any(arg in {'--rebase', '-r', '--squash', '-s'} for arg in args):
         raise ValueError('automatic finalization does not rewrite/squash feature history')
-    if not finalizer.hotfix(current['branch']) and not finalizer.current_receipt(root, current):
+    if not finalizer.current_receipt(root, current):
         return subprocess.call([str(Path(__file__).resolve().parent / 'feature-finalize'),
-                                '--mr', str(mr['iid'])], cwd=root)
+                                '--mr', str(mr['iid']),
+                                *(['--keep-source-branch'] if '--keep-source-branch' in args else [])], cwd=root)
     require_batch_proof(current['branch'], current['head'])
     ci = wait_for_ci(root, mr['iid'], current['branch'], current['head'],
                      finalizer.ci_requirements(root, current))
@@ -289,8 +298,15 @@ def merge_feature(mr, args):
     finalizer.refresh(root)
     proof = delivered.get('squash_commit_sha') or delivered.get('merge_commit_sha') or current['head']
     git('merge-base', '--is-ancestor', proof, 'refs/remotes/origin/dev', cwd=root)
+    cleanup_status = {'state': 'kept', 'reason': 'owner requested --keep-source-branch'}
+    if '--keep-source-branch' not in args:
+        try:
+            cleanup_status = cleanup_remote(delivered)
+        except (Deferred, ValueError, RuntimeError, KeyError, OSError, subprocess.SubprocessError) as exc:
+            cleanup_status = {'state': 'deferred', 'reason': str(exc),
+                              'resume': f'wt mr -- cleanup {mr["iid"]}'}
     print(json.dumps({'state': 'merged', 'target': 'dev', 'sha': current['head'],
-                      'source_preserved': True, 'ci': ci}, ensure_ascii=False))
+                      'local_source_preserved': True, 'cleanup': cleanup_status, 'ci': ci}, ensure_ascii=False))
     return 0
 
 
