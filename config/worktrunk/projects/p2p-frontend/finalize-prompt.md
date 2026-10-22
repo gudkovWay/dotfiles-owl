@@ -8,6 +8,15 @@ The attached source.json pins HEAD, origin/dev, merge-base and ALL feature paths
 
 Load the attached exact worktree .claude/commands/refactor.md. Use its applicable architecture rules and report their status. Its model: sonnet frontmatter, old external reference paths, unrestricted npx typecheck and shell output trimming do NOT override this run's model, native CI typecheck, resource guard, artifact hygiene or six-month maintainability. Resolve reference implementations from existing available code; never fabricate a reference. Preserve working shared abstractions, accessibility, responsive behavior, permission boundaries and money semantics. Do not mechanically rewrite unrelated features to enforce an old template.
 
+For UI work, read /home/q/.omp/agent/rules/frontend-design-flow.md and the applicable
+Taste app-screen route plus Anti Slop modules. The OMP adaptation takes precedence
+over taste-only upstream preferences. Preserve the agreed direction. For a redesign,
+read the existing .superpowers spec/matrix: reference revision, legacy target, intended
+per-region visual delta, preserved semantics and actual after evidence. Inspect every
+requested table column/cell, not only its wrapper. TheTable -> TheTableNext with legacy
+cell composition is migration, not redesign. Missing intended deltas are blockers;
+do not invent business fields or unrelated churn to make screenshots look different.
+
 Only frontend fixes for the cumulative feature and necessary callers/regressions. No product docs/README/changelog, lockfile/dependency changes, server-side CI changes, model/workflow config edits, unrelated cleanup, force push, automatic retries after resource/infra failure or hook bypass. No git staging/commits/push/MR/merge from the model: the deterministic controller owns delivery. No new global access, production changes or backend writes except the already approved minimal DEV test-account grants in repository-testing's p2p DEV permissions procedure. Missing access remains a named blocker.
 
 ## Review depth
@@ -23,6 +32,14 @@ No mutation. Return a concrete plan before implementation: evidence-linked findi
 ## Implement phase
 
 Read the saved plan. Implement useful fixes, not placeholders or speculative abstractions. Add/update behavior regressions in the native stack. Leave code unstaged. Controller runs selected unit tests, complete affected native typechecks, commits by topic, pushes, waits for exact-SHA CI and merges. Do not execute unit tests or typecheck during this phase; do not run a second parallel workload.
+
+Browser and Python are available through eval, not standalone tool names. Read
+xd://eval/browser before using its actual API. Attach only the owned wt ui cdp_url;
+observe before choosing selectors, use supported CSS/ARIA/text locators rather than
+guessing Playwright-only selectors. Keep credentials private inside local eval.
+Dispatch the finite wt ui supervisor asynchronously so eval can drive it; shut down
+only its own stop_file/tab. Do not parallelize mutations or duplicate checks in one
+environment. The controller waits for this phase before native verification.
 
 When .vue/styles or UI behavior changes, exercise the real affected screen/scenario via the reviewed owned headless wt ui profile under the existing shared guard. Reuse ready dependencies; the launcher prepares missing audited prerequisites. Use its owned CDP, not a personal browser/default relay or visible desktop. Read /home/q/.omp/agent/skills/repository-testing/SKILL.md first. Record nonzero PNG screenshot paths, concrete interactions/results and the exact source key from feature-finalize --source-key immediately after capture with no intervening source changes. No fabricated screenshots, DOM-only layout proof, auth bypass or secret-filled login screenshots. If a required screen cannot be exercised, report UI blocked/unverified; do not mark it verified to allow merge.
 

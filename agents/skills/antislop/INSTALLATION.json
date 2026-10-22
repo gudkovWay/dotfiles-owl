@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/miqdadbadjuber/anti-slop",
+  "version": "3.2.21",
+  "commit": null,
+  "provenance": "Snapshot of the owner-installed modules; upstream commit unknown; no network update performed.",
+  "files_sha256": {
+    "antislop/VERSION": "849bb24c350da9619a368892a29aba02c699dd6c1dc087da2b649aafad978b78",
+    "antislop/SKILL.md": "64a1ff70bafbfb7a105083cdff0026a6f09baf7e19d3aa1bc3e880cf7233f90c",
+    "antislop-ui/SKILL.md": "47d9892771253f544f7eb2e40af35fd5c31407dcd8c048183bbd1de5a00a4bbe",
+    "antislop-human/contrast-check.py": "393e6433d120632aa11184792a16cd7b325924dbc9993477825d9aa67fdbfe6e",
+    "antislop-human/SKILL.md": "cfa37d69600e08d37561163d8b794019204f1db1ccb6127bd2a6da23036401b6",
+    "antislop-human/contrast-mcp.py": "185bea237eb28968908915aae32e9c1f043bc9cae5c7a157eec4651bee1fc3e9",
+    "antislop-layoutmobile/SKILL.md": "8613395a5109f637837f5c24f0ce5e58a96df1c2567a9f7666fcaecc47ff39cd",
+    "antislop-copywriting/SKILL.md": "2434a6fb0603dea1e62d4c1968382def47af779bd0e43b2130edd49df41ba444",
+    "antislop-code/SKILL.md": "004933009d352710dcbea7817101d5c188474a442e3ece26a6e0c18d3223898f"
+  }
+}

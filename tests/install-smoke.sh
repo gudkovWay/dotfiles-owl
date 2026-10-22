@@ -80,6 +80,17 @@ for entry in \
   'omp/extensions/jev-shadow.ts:.omp/agent/extensions/jev-shadow.ts' \
   'omp/jev/task-context.ts:.omp/agent/jev/task-context.ts' \
   'omp/rules/no-autotests.md:.omp/agent/rules/no-autotests.md' \
+  'omp/rules/frontend-design-flow.md:.omp/agent/rules/frontend-design-flow.md' \
+  'omp/rules/delegation-pipeline.md:.omp/agent/rules/delegation-pipeline.md' \
+  'omp/skills/design-taste-frontend/SKILL.md:.omp/agent/skills/design-taste-frontend/SKILL.md' \
+  'omp/skills/design-taste-frontend/INSTALLATION.json:.omp/agent/skills/design-taste-frontend/INSTALLATION.json' \
+  'omp/skills/design-taste-frontend/scripts/inspect.mjs:.omp/agent/skills/design-taste-frontend/scripts/inspect.mjs' \
+  'agents/skills/antislop/SKILL.md:.agents/skills/antislop/SKILL.md' \
+  'agents/skills/antislop-ui/SKILL.md:.agents/skills/antislop-ui/SKILL.md' \
+  'agents/skills/antislop-human/contrast-check.py:.agents/skills/antislop-human/contrast-check.py' \
+  'agents/skills/antislop-layoutmobile/SKILL.md:.agents/skills/antislop-layoutmobile/SKILL.md' \
+  'agents/skills/antislop-copywriting/SKILL.md:.agents/skills/antislop-copywriting/SKILL.md' \
+  'agents/skills/antislop-code/SKILL.md:.agents/skills/antislop-code/SKILL.md' \
   'agents/skills/starting-worktree-work/SKILL.md:.agents/skills/starting-worktree-work/SKILL.md'; do
   source="${entry%%:*}"
   destination="$FAKE_HOME/${entry#*:}"
