@@ -85,6 +85,7 @@ for entry in \
   'omp/jev/task-context.ts:.omp/agent/jev/task-context.ts' \
   'omp/rules/no-autotests.md:.omp/agent/rules/no-autotests.md' \
   'omp/rules/autonomous-decisions.md:.omp/agent/rules/autonomous-decisions.md' \
+  'omp/rules/окна-тестов.md:.omp/agent/rules/окна-тестов.md' \
   'omp/rules/frontend-design-flow.md:.omp/agent/rules/frontend-design-flow.md' \
   'omp/rules/delegation-pipeline.md:.omp/agent/rules/delegation-pipeline.md' \
   'omp/skills/design-taste-frontend/SKILL.md:.omp/agent/skills/design-taste-frontend/SKILL.md' \
@@ -96,6 +97,11 @@ for entry in \
   'agents/skills/antislop-layoutmobile/SKILL.md:.agents/skills/antislop-layoutmobile/SKILL.md' \
   'agents/skills/antislop-copywriting/SKILL.md:.agents/skills/antislop-copywriting/SKILL.md' \
   'agents/skills/antislop-code/SKILL.md:.agents/skills/antislop-code/SKILL.md' \
+  'agents/skills/desktop-sandbox/SKILL.md:.agents/skills/desktop-sandbox/SKILL.md' \
+  'agents/skills/desktop-sandbox/references/display-fallback.md:.agents/skills/desktop-sandbox/references/display-fallback.md' \
+  'agents/skills/desktop-sandbox/references/isolation-render-evidence.md:.agents/skills/desktop-sandbox/references/isolation-render-evidence.md' \
+  'agents/skills/desktop-sandbox/scripts/vd-run.sh:.agents/skills/desktop-sandbox/scripts/vd-run.sh' \
+  'agents/skills/desktop-sandbox/scripts/check-workspaces.py:.agents/skills/desktop-sandbox/scripts/check-workspaces.py' \
   'agents/skills/starting-worktree-work/SKILL.md:.agents/skills/starting-worktree-work/SKILL.md'; do
   source="${entry%%:*}"
   destination="$FAKE_HOME/${entry#*:}"
