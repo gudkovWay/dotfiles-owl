@@ -84,6 +84,7 @@ for entry in \
   'omp/extensions/jev-shadow.ts:.omp/agent/extensions/jev-shadow.ts' \
   'omp/jev/task-context.ts:.omp/agent/jev/task-context.ts' \
   'omp/rules/no-autotests.md:.omp/agent/rules/no-autotests.md' \
+  'omp/rules/autonomous-decisions.md:.omp/agent/rules/autonomous-decisions.md' \
   'omp/rules/frontend-design-flow.md:.omp/agent/rules/frontend-design-flow.md' \
   'omp/rules/delegation-pipeline.md:.omp/agent/rules/delegation-pipeline.md' \
   'omp/skills/design-taste-frontend/SKILL.md:.omp/agent/skills/design-taste-frontend/SKILL.md' \
