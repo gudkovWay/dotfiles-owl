@@ -27,6 +27,12 @@ link() {                       # link <источник в репе> <куда>
   echo "link  $dst"
 }
 
+# Scoped deployment must not relink unrelated desktop configs or restart services.
+if [[ ${1:-} == --omp-document ]]; then
+  shift
+  exec python3 "$REPO/omp/install-document.py" "$@"
+fi
+
 # ── ~/.config ──────────────────────────────────────────────────────────────
 while IFS= read -r -d '' f; do
   link "$f" "$CONFIG/${f#config/}"
@@ -69,6 +75,7 @@ link local/share/icons/Dot-Dark "$HOME/.icons/Dot-Dark"
 # Только отслеживаемые расширения и authored workflow-файлы. Базы, сессии,
 # receipts, provider config и секреты ~/.omp остаются локальными.
 link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
+link omp/extensions/document-markdown "$HOME/.omp/agent/extensions/document-markdown"
 link omp/extensions/prompt-card "$HOME/.omp/agent/extensions/prompt-card"
 link omp/extensions/image-links.ts "$HOME/.omp/agent/extensions/image-links.ts"
 link omp/extensions/jev-shadow.ts "$HOME/.omp/agent/extensions/jev-shadow.ts"
