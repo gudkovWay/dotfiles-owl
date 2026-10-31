@@ -74,6 +74,10 @@ link local/share/icons/Dot-Dark "$HOME/.icons/Dot-Dark"
 # ── OMP ────────────────────────────────────────────────────────────────────
 # Только отслеживаемые расширения и authored workflow-файлы. Базы, сессии,
 # receipts, provider config и секреты ~/.omp остаются локальными.
+# Skills-only defaults: a real local config (including models/providers) wins.
+link omp/config.yml "$HOME/.omp/agent/config.yml"
+link omp/SYSTEM_TEMPLATE.md "$HOME/.omp/agent/SYSTEM_TEMPLATE.md"
+link omp/lsp.json "$HOME/.omp/agent/lsp.json"
 link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
 link omp/extensions/document-markdown "$HOME/.omp/agent/extensions/document-markdown"
 link omp/extensions/prompt-card "$HOME/.omp/agent/extensions/prompt-card"
@@ -85,7 +89,7 @@ link omp/herdr-local-files "$HOME/.local/share/omp/herdr-local-files"
 link omp/extensions/owner-approval.js "$HOME/.omp/agent/extensions/owner-approval.js"
 while IFS= read -r -d '' f; do
   link "$f" "$HOME/.omp/agent/${f#omp/}"
-done < <(git -C "$REPO" ls-files -z -- omp/hooks omp/rules omp/skills omp/jev)
+done < <(git -C "$REPO" ls-files -z -- omp/hooks omp/rules omp/skills omp/skill-bundles omp/jev)
 while IFS= read -r -d '' f; do
   link "$f" "$HOME/.agents/${f#agents/}"
 done < <(git -C "$REPO" ls-files -z -- agents/skills)
