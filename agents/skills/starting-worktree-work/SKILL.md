@@ -1,6 +1,6 @@
 ---
 name: starting-worktree-work
-description: Use when choosing a new working branch in any repository; when starting any feature, project, or hotfix work, or any change to feature/project/hotfix code; when publishing a p2p DEV branch or planning its automatic Payscrow stand; when synchronizing branches before commit, push, or MR delivery, including pull, rebase, or a non-fast-forward rejection; when a linked worktree may already exist or an integration DEV-* branch is occupied by a live agent; when the current worktree has uncommitted changes; when writing p2p Nuxt env overrides; when creating a GitLab MR via wt mr or glab; when basing a branch on a release tag.
+description: Use when starting feature/project/hotfix work in any repository; when the owner says finalize, to finalize, финализируй, доведи до конца to finish development through an open PR/MR; when choosing branches, resolving linked worktree ownership, synchronizing before commit/push/PR/MR or fixing non-fast-forward; when publishing p2p DEV stands, writing p2p Nuxt env overrides or creating GitLab MRs; when basing work on a release tag.
 ---
 
 # Worktree-first вход в работу
@@ -10,21 +10,13 @@ description: Use when choosing a new working branch in any repository; when star
 Перед выбором имени ветки прочитай `/home/q/.omp/agent/rules/branch-naming.md`:
 это единая глобальная политика для всех проектов, включая локальные worktree.
 
-## Приоритет над общими скиллами
+## Единственный worktree/delivery workflow
 
-Триггер «начинаю фичу — нужна изоляция» заявляют ещё два скилла superpowers, и дедуп по
-имени их не схлопывает. Правило разрешения:
-
-- `using-git-worktrees` — общий фолбэк «native tools или `git worktree add`». В репозитории,
-  где есть worktrunk (`git config --local worktrunk.default-branch` отвечает) или политика
-  `DEV-*`, побеждает ЭТОТ скилл: `git worktree add` руками здесь запрещён. Указатели
-  «use superpowers:using-git-worktrees» внутри `executing-plans`,
-  `subagent-driven-development` и `writing-plans` в таких репозиториях читать как указатель
-  сюда.
-- `finishing-a-development-branch` — общий разбор «как интегрировать готовую работу». Его
-  варианты с локальным merge неприменимы к p2p: там интеграция только через GitLab MR
-  (`wt mr` с guard по apiBase, см. §7), `wt merge` не предписывается. Вне p2p его варианты
-  законны.
+OMP использует этот скилл для worktree, синхронизации и доставки.
+Superpowers orchestration/worktree/finishing skills исключены из discovery;
+не загружай их как обязательную цепочку. Сохранённые четыре адресных метода
+Superpowers не меняют полномочия и порядок Worktrunk. При глобальном finalize
+конечная точка — открытый PR/MR без merge/auto-merge; в p2p только §7, не `wt merge`.
 
 ## 1. Определи существующий worktree
 
@@ -125,16 +117,23 @@ JSON, ручной `cd` не нужен. `-x omp` (свежий OMP владее
    вопроса. Для p2p в owned task-worktree: `git fetch origin dev` →
    `git rebase origin/dev`; эквивалент — `git pull origin dev --rebase`.
    В остальных репозиториях используй разрешённую базу, не подставляй `dev`.
-3. **Опубликованная feature/task-ветка:** rebase допустим только после
-   отдельного разрешения переписать именно эту ветку. Обычное «commit/push
-   to dev» такого разрешения не даёт. Уже полученный апрув того же rewrite
-   scope не спрашивай повторно; общую ветку или работу другого владельца
-   автоматически не переписывай.
-4. **Push после разрешённого rebase:** заранее сохрани проверенный SHA
+3. **Опубликованная feature/task-ветка:** в `p2p-frontend` rebase своей текущей
+   task-ветки на `origin/dev` заранее разрешён владельцем, без отдельного
+   запроса на переписывание при каждой синхронизации. Это относится только к
+   owned linked worktree и собственной ветке задачи, не к чужой/общей ветке
+   или integration target. До rebase проверь, что исходный remote tip входит
+   в локальную историю; неизвестные/чужие коммиты сначала исследуй и сохрани.
+   В остальных репозиториях опубликованный rebase требует отдельного
+   разрешения именно этой ветки; уже полученный апрув не спрашивай повторно.
+4. **Push после разрешённого rebase:** до rebase сохрани проверенный полный SHA
    исходного remote ref. Если нужен non-fast-forward push, используй только
-   `--force-with-lease=refs/heads/<task>:<old-sha>`, не `--force`. Отказ lease
-   означает, что remote изменился: исследуй новые коммиты, не обновляй lease
-   вслепую и не затирай чужую работу. Авторизация доставки остаётся отдельной.
+   `--force-with-lease=refs/heads/<task>:<old-sha>`, не `--force` и не неявный lease.
+   В p2p выполняй `wt push -- --force-with-lease=refs/heads/<task>:<old-sha> origin <task>`:
+   для собственной task-ветки отдельный rewrite-апрув не нужен.
+   Отказ lease означает, что remote изменился: исследуй новые коммиты,
+   не обновляй lease вслепую и не затирай чужую работу. Сам push/delivery должен
+   входить в разрешённый scope задачи (например, finalize); это правило
+   снимает дополнительный rewrite-вопрос, но не разрешает постороннюю доставку.
 5. **Общая integration-ветка (`dev`, `main`, release):** обновляй локальный
    checkout только fast-forward: для p2p `git pull --ff-only origin dev`.
    При расхождении истории остановись; не rebase/reset/force-push общего ref.
@@ -144,8 +143,8 @@ JSON, ручной `cd` не нужен. `-x omp` (свежий OMP владее
    для этой синхронизации; назови исключение. Уже доставленные merge-коммиты
    в общем target не удаляй и не переписывай ради линейности.
 7. **После rebase:** разреши конфликты с сохранением согласованного поведения,
-   повтори релевантные проверки на итоговом состоянии; новый SHA требует
-   нового CI-доказательства. Если база снова продвинулась, повтори этот
+   повтори релевантные проверки на итоговом состоянии; если CI применим
+   по §7, новый SHA требует нового CI-доказательства. Если база снова продвинулась, повтори этот
    порядок, а не добавляй merge-коммит. MR/CI/cleanup-контракт §7 сохраняется;
    integration merge по разрешённому workflow не является merge базы в task.
 
@@ -270,20 +269,24 @@ Helper выбирает PSC-роли по слоям/приложениям; com
 
 
 
-## 6d. p2p: feature finalization перед merge
+## 6d. p2p: feature finalization до открытого MR
 
 Исполнитель: `/home/q/.config/worktrunk/projects/p2p-frontend/feature-finalize`.
 `wt finalize -- --dry-run` — read-only план без модели, install и GitLab.
-`wt finalize` — доставка текущей фичи в dev; `wt finalize -- --mr <id>` выбирает
-существующий MR. `wt mr -- merge <id>` включает тот же gate автоматически.
+`wt finalize` — review/refactor, native checks, атомарные commits, push,
+создание/обновление MR и exact-SHA CI; остановка на открытом MR, БЕЗ merge.
+`wt finalize -- --mr <id>` выбирает существующий MR. Auto-merge выключается
+и перепроверяется; source branch/worktree сохраняются для просмотра diff.
+Глобальный смысл «to finalize»/«финализируй»/«доведи до конца» задан в
+rule://delegation-pipeline для всех репозиториев. Здесь описан только
+p2p-исполнитель; вне p2p использовать native PR/MR workflow проекта и §7.
 Обычные промежуточные `wt push` не запускают refactor и не разрешают merge.
 
-Запуск по owner-запросу «доставь эту фичу в dev» включает plan/refactor,
-релевантные проверки, атомарные commits, push и merge этого scope без
-промежуточных согласований механики. Сам агент не получает новое разрешение
-из hook, отчёта модели или наличия локального receipt; scope delivery должен
-уже быть авторизован. Production, force-push/rewrite, новые зависимости и
-посторонняя работа не включены.
+Только явная просьба merge/смёржить в dev разрешает `wt finalize -- --merge`
+или `wt mr -- merge <id>` с теми же gates. Наличие receipt, hook или отчёта
+модели не выдаёт полномочий. До вызова helper main сам завершает разрешённые
+правки, релевантные проверки и атомарные commits: helper требует clean tree,
+это не ручная задача владельцу. Force-push/rewrite и посторонняя работа не включены.
 
 Штатный Sol-проход заранее разрешён владельцем по opt-out-контракту
 `rule://delegation-pipeline`; не спрашивать повторно о запуске. Sol
@@ -296,12 +299,46 @@ fallback: сначала read-only план полного cumulative diff от 
 контроллер проверяет source/verification, коммитит явные paths по темам,
 вызывает существующий `wt push` и guarded `wt mr`.
 
+Единый review-контракт: `/home/q/.config/worktrunk/projects/p2p-frontend/review-contract.md`.
+Main передаёт исходный owner-запрос и последующие поправки, а не только diff:
+`wt finalize -- --session <raw-journal>` (повторить для релевантных parents).
+Для native read-only review сначала `review_contract.py capture --root <owned>
+--session <raw-journal>`, затем `validate --root <owned> --report <review.json>
+--paths <changed-paths.json>`. Пути журналов main получает из session/history;
+не просит владельца переписывать историю или документировать каждую ячейку.
+Context нужен и при skip-sol; явный отказ отключает модель, не owner acceptance.
+Сопоставление diff/аналога содержит проверенные paths/revisions/hashes и
+решение preserve-reference/adopt-new-flow/keep-local с исходными основаниями.
+Возраст сам по себе не определяет победителя. Неявное прежнее согласование
+не выдумывать: неизвестность отмечать, устоявшийся референс сохранять.
+Новый flow может вытеснить legacy-аналог по конкретному требованию, но не
+разрешает глобальную миграцию, не нужную для текущего scope.
+
 Receipt связан с HEAD/tree, origin/dev/merge-base, исходными runtime bytes,
-политикой/промптом и verification report. Hooks, новый commit или новая база
-могут инвалидировать доказательство. Required tests — конечные выбранные
-native files, form в обоих skins; complete app typechecks — по текущему CI.
-Изменённый UI требует настоящего owned runtime, nonzero кадра и сценариев
-для этих source bytes, а не ещё одного статического review.
+политикой/общим review-контрактом, owner-context и verification report.
+Новая owner-поправка, hooks, commit или база могут инвалидировать evidence.
+Required tests — конечные выбранные native files, form в обоих skins;
+complete app typechecks — по текущему CI. Изменённый UI требует настоящего
+owned runtime, nonzero кадра и сценариев для этих source bytes, а не ещё
+одного статического review.
+
+Sol-этап ограничен source: terminal `agent_end` с stopReason=stop и полный
+`implementation.json` с текущим source_key обязательны. Exit 0 и непустой лог
+сами по себе не закрывают этап. Браузер и tests/typecheck не входят в model phase.
+
+Если нужен UI, helper сохраняет `awaiting_ui` и точный run-dir. Main выполняет
+штатный `wt ui` на итоговых bytes и передаёт owned JSON:
+`wt finalize -- --resume <run-dir> --ui-proof <owned-ui-proof.json>`.
+Файл содержит только `ui` и, при необходимости, обновлённый `review`.
+Нужны status=verified, актуальный source_key, реальные scenarios и существующие
+PNG. Возобновление не запускает Sol снова; source/policy/context/artifact drift
+отклоняется. После влияющего hook нужен свежий proof; post-commit resume не
+создаёт повторный commit. Failed/OOM/timeout run нельзя возобновлять таким путём.
+
+Доказанный never-started resource admission сохраняет `awaiting_checks`;
+продолжение той же ревизии — `wt finalize -- --resume <run-dir>`.
+Это не PASS и не replay уже запускавшегося workload. JSON-native assertions
+идут в bounded source correction; OOM/timeout/infra failure — нет.
 
 Hotfix тоже проходит Sol по умолчанию. Только явный отказ владельца
 разрешает `wt finalize -- --skip-sol --reason '<отказ>' --manifest <json>`;
@@ -328,45 +365,84 @@ branch/worktree остаются для живой сессии; `wt mr -- clean
 - До merge обязателен CI-гейт актуального MR SHA ниже; зелёный локальный
   typecheck не заменяет проверку доставляемого коммита на стороне CI.
 
-### CI перед merge и cleanup
+### CI перед merge и cleanup — по контракту проекта
 
-Этот порядок действует при доставке в репозитории с CI, не только в p2p.
-Он не даёт нового разрешения на commit/push/merge, изменение GitLab-проекта,
+Этот раздел применяется к доставке во всех репозиториях, включая GitHub PR,
+GitLab MR и разрешённую локальную интеграцию. P2P-гейт выше остаётся обязательным;
+его нельзя автоматически переносить на остальные проекты.
+Раздел не даёт разрешения на commit/push/merge, изменение настроек проекта,
 запуск дополнительных pipeline или отмену чужих jobs.
+
+**Сначала установи применимость CI, не требуй его существования.**
+
+- Источники обязательности: явные критерии задачи, действующая политика доставки
+  проекта, required checks/rulesets/branch protection и обязательные native gates.
+  Наличие `.github/workflows`, старых runs или CI в upstream само по себе
+  не делает Actions обязательными для форка. Проверь применимость к target,
+  событию и изменённым paths; GitHub Actions — не единственный CI-провайдер.
+- Read-only проверкой различи `required`, `optional`, `not configured` и
+  `disabled/unavailable`. Обязательность и доступность — разные факты.
+  Пустой список checks не доказывает ни успех, ни обязательность CI.
+  API error/недостаток доступа не доказывает отсутствие required checks:
+  если это нельзя выяснить из доступного контракта, назови конкретный unknown.
+- Если обязательного CI-контракта нет, отсутствие CI, неприменимый workflow
+  или отключённые Actions не блокируют уже разрешённый merge и не требуют
+  owner-исключения. Продолжи после остальных применимых проверок; укажи
+  `CI: not applicable` с основанием либо `CI: unverified — disabled/unavailable`,
+  а не PASS. Это не отменяет local tests/typecheck/runtime, hooks и merge permissions.
+- Если CI обязателен, missing/skipped/canceled/disabled остаётся блокером
+  именно этого требования. Не заменяй его локальным exit 0. Текущее применимое
+  pending/running или failed CI также не объявляй отсутствующим ради merge;
+  проверь контракт и причину, дождись/исправь по процедуре ниже.
+- Не создавай/не меняй workflow, не включай Actions, не меняй permissions,
+  billing или branch protection и не делай пустые commits/reopen PR ради CI
+  только потому, что checks не появились. Настройка/восстановление CI —
+  отдельный явно запрошенный scope, не подразумеваемая часть merge.
+
+Перед merge запиши одной строкой: `CI: <обязательность>; основание:
+<policy/required checks>; доступность: <state>; решение: <ждать/блокер/не блокирует>`.
+Если CI неприменим/необязателен и отсутствует, пропусти ожидание CI ниже,
+но сохрани local verification, проверку target и безопасность cleanup.
 
 1. До доставки выполни релевантные native tests и обязательный локальный
    typecheck по `skill://repository-testing`. Если hooks изменили проверенные
    входы, повтори затронутые проверки на итоговом состоянии.
-2. После авторизованного push получи актуальный MR SHA и соответствующий
-   pipeline через read-only GitLab API/CLI. По текущему CI-контракту проверь
-   наличие и успех всех обязательных jobs/вариантов, включая typecheck.
-   Зелёный старый SHA, пустой набор jobs, missing/skipped/canceled проверки
-   не закрывают gate; optional/manual jobs определяются контрактом, не догадкой.
-3. Running/pending CI ожидай сам без вопроса «можно ли дождаться?», с конечным
-   deadline и умеренным интервалом API-запросов. Если ожидание истекло,
-   сохрани ветку/MR и назови pending delivery; не объявляй задачу доставленной.
+2. Для применимого CI после авторизованного push получи актуальный PR/MR SHA
+   и соответствующий pipeline/check runs через read-only API/CLI провайдера.
+   По установленному контракту проверь обязательные jobs/варианты, включая
+   typecheck, если он требуется этим контрактом. Старый SHA и пустой набор
+   jobs не закрывают обязательный gate; optional/manual jobs определяются
+   контрактом. Отсутствие необязательных jobs не создаёт новый gate.
+3. Применимый running/pending CI ожидай сам без вопроса «можно ли дождаться?»,
+   с конечным deadline и умеренным интервалом API-запросов. Не ожидай появления
+   необязательного отсутствующего CI. Если ожидание истекло, сохрани ветку/PR/MR
+   и назови pending delivery; не объявляй задачу доставленной.
    Ошибку типов/assertion или исправимый дефект исходника/тестовой конфигурации
    расследуй, исправь в согласованном scope и повтори локальные проверки без
    нового апрува. Push исправления — только в уже авторизованном delivery scope;
-   новый SHA требует нового CI-доказательства. Инфраструктурный сбой — блокер,
-   а не разрешение на слепые CI retries, новые зависимости или обход caps.
-4. Непосредственно перед merge снова сверь MR SHA, pipeline и обязательные jobs.
-   Не вызывай немедленный merge при незавершённом/красном CI. Native auto-merge
-   допустим лишь при доказанном server-side CI-гейте и безопасном cleanup.
+   новый SHA требует нового доказательства применимого CI. Инфраструктурный
+   сбой обязательного CI — блокер, а не разрешение на слепые retries,
+   новые зависимости или обход caps.
+4. Непосредственно перед merge снова сверь PR/MR SHA и применимые CI gates.
+   Не вызывай немедленный merge при незавершённом/красном применимом CI.
+   Native auto-merge допустим лишь при доказанном server-side CI-гейте
+   и безопасном cleanup.
    В p2p на 2026-10-09 `only_allow_merge_if_pipeline_succeeds=false`:
    не рассчитывай на серверный барьер без новой проверки настройки.
 5. Source branch нельзя удалять, пока pipeline/jobs, использующие её ref,
    ещё могут выполнять checkout: проверь также branch/child pipelines,
    pending/running/delayed jobs и ожидающие запуска обязательные manual jobs.
    Успех MR pipeline сам по себе не доказывает завершение branch pipeline.
-   Wrapper запрещает server-side delete в самой команде merge, затем сам
+   P2P wrapper запрещает server-side delete в самой команде merge, затем сам
    удаляет remote source после проверки потребителей. Неизвестный/активный
    consumer сохраняет ref; `wt mr -- cleanup <id>` заново проверяет его
-   и завершает local cleanup. Не обходи guard прямым glab; назови конкретный
-   cleanup blocker, отдельно от подтверждённой доставки.
+   и завершает local cleanup. Не обходи guard прямым glab; в других проектах
+   используй их native cleanup. Подтверждённое отсутствие consumers не требует
+   создания pipeline. Cleanup blocker отделяй от подтверждённой доставки.
 6. После merge проверь присутствие доставленных коммитов в согласованном target.
-   В отчёте раздели local tests, local typecheck, CI pipeline/SHA/jobs,
-   merge/target и cleanup; ни push, ни локальный exit 0 не означают доставку.
+   В отчёте раздели local tests, local typecheck, применимость/доступность CI
+   и его pipeline/SHA/jobs, merge/target и cleanup; ни push, ни локальный exit 0
+   не означают доставку. Отсутствующий CI не выдавай за успешный.
 
 
 ### Доставка всей согласованной задачи
@@ -393,7 +469,8 @@ branch/worktree остаются для живой сессии; `wt mr -- clean
 | MR | `wt mr` (apiBase + feature receipt + exact-SHA CI) → pinned `glab mr` |
 | Выбор PSC-приложений по committed diff | `wt stand -- --plan` (read-only) |
 | Продолжить PSC bootstrap после разрешённой публикации | `wt stand -- --ensure` |
-| Доставка фичи в dev | `wt finalize` (только в авторизованном scope) |
+| До открытого MR без merge | `wt finalize` (только в авторизованном scope) |
+| Явно разрешённый merge | `wt finalize -- --merge` / `wt mr -- merge <id>` |
 
 ## Решения
 
@@ -414,6 +491,8 @@ branch/worktree остаются для живой сессии; `wt mr -- clean
 
 | Дата | Запись |
 |---|---|
+| 2026-10-28 | P2P: rebase своей опубликованной task-ветки и точный force-with-lease при разрешённой доставке не требуют отдельного rewrite-апрува. Общие/integration refs и чужая работа исключены; ordinary/batch hooks и verification сохраняются. |
+| 2026-10-25 | CI merge-gate определяется контрактом проекта, не наличием workflow или привычкой p2p. Отсутствующий/отключённый необязательный CI не блокирует разрешённую интеграцию и не требует owner-исключения; настройка CI не входит в merge автоматически. |
 | 2026-10-22 | Sol high/priority по opt-out, eval вместо несуществующих browser/python tools; remote cleanup после idle consumers по умолчанию, local tree сохраняется. UI redesign требует reference/before/after по frontend-design-flow. [OVERSIZE: delivery, synchronization and lifecycle form one workflow] |
 | 2026-10-14 | `wt push` обслуживает ordinary/batch публикацию и подключает только PSC после доказанного empty state-check. Приложения определяются по committed diff; существующая WL-гранулярность dyn-env сохранена. |
 | 2026-10-09 | Закреплены rebase рабочих веток, ff-only обновление общего checkout и отдельный апрув опубликованного rewrite с точным force-with-lease. CI-гейт, cleanup и commit-readiness сохранены. |
@@ -429,4 +508,5 @@ branch/worktree остаются для живой сессии; `wt mr -- clean
 - 2026-09-14 (найдено 09-15): «Таже сессия: … затем пользователь `/wt <branch>` переносит live session» — модель честно ждала человека, 3 остановки за день. Правило меняло поведение не в ту сторону: способность агента работать через абсолютный путь не зависит от якоря сессии. Заменено агентским путём; старый запрет «НЕ редактируй код, пока пользователь не выполнит `/wt`» удалён как вредоносный.
 - 2026-10-04: в p2p-сессиях создавались `agent/inter-app-font` и `agent/shadcn-label-regular` после чтения этого скилла: он описывал базу и переиспользование DEV-веток, но не именование новых. Теперь перед выбором имени загружается единая глобальная политика.
 - 2026-10-09, session `01a12075-9146-77c9-9234-438fb572aab9`: MR был merged до завершения typecheck, затем раннее удаление source branch сломало checkout branch pipeline. Локальные тесты, CI merge-gate и безопасность cleanup — разные обязательства.
-- 2026-10-09, sessions `01a12119-b235` и `01a12126-fe6c`: рабочие ветки синхронизировались через локальные merge-коммиты «merge dev before delivery». Fast-forward режим GitLab не запрещает такие коммиты внутри task-ветки. Для синхронизации теперь используется §5a; опубликованный rewrite требует отдельного разрешения.
+- 2026-10-09, sessions `01a12119-b235` и `01a12126-fe6c`: рабочие ветки синхронизировались через локальные merge-коммиты «merge dev before delivery». Fast-forward режим GitLab не запрещает такие коммиты внутри task-ветки. Для синхронизации используется §5a; с 2026-10-28 собственная p2p task-ветка имеет standing rewrite-разрешение, остальные опубликованные ветки требуют отдельного апрува.
+- 2026-10-25, session `01a173ea-7001-75fd-a09b-c496e907c5de`: отсутствие Actions на форке Noctalia объявили блокером merge без установленного обязательного CI-контракта; добавили триггеры и пытались включить Actions. Теперь сначала устанавливается применимость/обязательность CI, отдельно от доступности; p2p-гейт не переносится на форки.

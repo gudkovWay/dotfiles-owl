@@ -1,4 +1,4 @@
-"""Feature-only plan/refactor/check/commit/push/MR orchestration outside Git hooks."""
+"""Feature plan/refactor/check/push/open-MR; merge requires a separate explicit mode."""
 import argparse
 from contextlib import contextmanager
 import fcntl
@@ -14,6 +14,7 @@ import time
 from urllib.parse import quote
 
 from merge_readiness import Forge, required_jobs, validate_mr, wait_for_ci
+from review_contract import context_path, load_context, store_context, validate_review
 
 HERE = Path(__file__).resolve().parent
 PROJECTS = HERE.parent
@@ -67,9 +68,12 @@ def feature_diff(root, current):
 
 def policy_key(root):
     paths = [Path(__file__), HERE / 'merge_readiness.py', HERE / 'finalize-prompt.md',
+             HERE / 'review-contract.md', HERE / 'review_contract.py',
              HERE / 'typecheck', PROJECTS / 'project-environment', PROJECTS / 'ui-session',
              root / '.claude/commands/refactor.md']
-    return hashlib.sha256(''.join(str(p) + '\0' + sha256(p) for p in paths).encode()).hexdigest()
+    context = context_path(root)
+    context_key = sha256(context) if context.is_file() else 'missing-owner-context'
+    return hashlib.sha256((''.join(str(p) + '\0' + sha256(p) for p in paths) + context_key).encode()).hexdigest()
 
 
 def receipt_for(current, policy, verification):
@@ -132,11 +136,12 @@ def current_receipt(root, current=None):
         if path.is_symlink():
             return False
         value = json.loads(path.read_text())
+        load_context(root)
         proof = Path(value['verification'])
         if not proof.is_relative_to(root / '.superpowers/finalize') or proof.is_symlink():
             return False
         return receipt_matches(value, current, policy_key(root), proof)
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         return False
 
 
@@ -146,7 +151,7 @@ def refresh(root):
 
 def agent_command(root, inputs, plan):
     tools = 'read,glob,grep' if plan else 'read,glob,grep,edit,write,bash,todo,eval'
-    return ['omp', '--print', '--model=' + MODEL, '--thinking=high', '--service-tier=priority', '--no-prewalk',
+    return ['omp', '--print', '--mode=json', '--model=' + MODEL, '--thinking=high', '--service-tier=priority', '--no-prewalk',
             '--no-extensions', '--no-title', '--no-lsp', '--auto-approve', '--max-time=' + str(MODEL_SECONDS),
             '--cwd=' + str(root), '--tools=' + tools, *('@' + str(path) for path in inputs)]
 
@@ -154,15 +159,40 @@ def agent_command(root, inputs, plan):
 def run_agent(root, inputs, output, plan):
     phase = 'plan' if plan else 'refactor'
     print(f'feature-finalize: Sol {phase} starting (high, priority); log: {output}', flush=True)
-    command = [str(GUARD), '--need', '2G' if plan else '6G', '--wait', '60',
+    command = [str(GUARD), '--need', '2G' if plan else '6G',
+               '--tasks', '256', '--wait', '60',
                '--exclusive-key', str(root), '--', *agent_command(root, inputs, plan)]
-    with output.open('w') as log:
+    events = output.with_suffix('.events.jsonl')
+    with events.open('w') as log:
         result = subprocess.run(command, cwd=root, stdout=log, stderr=subprocess.STDOUT)
     if result.returncode:
-        raise RuntimeError(f'Sol phase exited {result.returncode}; no automatic retry; evidence: {output}')
-    if output.stat().st_size == 0:
-        raise RuntimeError('Sol returned no output; no completion proof: ' + str(output))
-    print(f'feature-finalize: Sol {phase} complete; log: {output}', flush=True)
+        raise RuntimeError(f'Sol phase exited {result.returncode}; no automatic retry; evidence: {events}')
+    terminal = None
+    for line in events.read_text(errors='replace').splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get('type') == 'agent_end':
+            assistants = [m for m in event.get('messages', []) if m.get('role') == 'assistant']
+            terminal = assistants[-1] if assistants else None
+    if not terminal or terminal.get('stopReason') != 'stop':
+        raise RuntimeError('Sol has no successful terminal completion; no retry: ' + str(events))
+    text = '\n'.join(p['text'] for p in terminal.get('content', [])
+                     if p.get('type') == 'text' and isinstance(p.get('text'), str)).strip()
+    if not text:
+        raise RuntimeError('Sol returned no completion text: ' + str(events))
+    output.write_text(text + '\n')
+    if not plan:
+        path = output.parent / 'implementation.json'
+        try:
+            manifest = json.loads(path.read_text())
+            if manifest.get('source_key') != source_key(root):
+                raise ValueError('source identity mismatch')
+            validate_manifest(root, manifest, changed_paths(root))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError) as error:
+            raise RuntimeError(f'invalid implementation manifest: {path}: {error}') from error
+    print(f'feature-finalize: Sol {phase} complete; log: {events}', flush=True)
 
 
 def changed_paths(root):
@@ -234,12 +264,13 @@ def test_commands(root, selections):
 
 
 class CheckFailed(RuntimeError):
-    def __init__(self, message, source=False):
+    def __init__(self, message, source=False, kind=None):
         super().__init__(message)
         self.source = source
+        self.kind = kind or ('source_failure' if source else 'infrastructure_failure')
 
 
-def checked(root, command, log, env=None):
+def checked(root, command, log, env=None, report=None):
     names = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z', '--',
                                      '**/.nuxtrc', '.nuxtrc']).decode().split('\0')
     before = {name: (root / name).read_bytes() if (root / name).exists() else None
@@ -260,14 +291,42 @@ def checked(root, command, log, env=None):
         raise CheckFailed('tracked .nuxtrc mutated; restored pre-command contents; environment attempt stopped: '
                           + ', '.join(mutated))
     text = log.read_text(errors='replace')
+    data = None
+    if report is not None and report.is_file():
+        try:
+            data = json.loads(report.read_text())
+        except (ValueError, OSError):
+            pass
+    lifecycle = []
+    for line in text.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get('event') in {'deferred', 'admitted', 'workload_start', 'completed'}:
+            lifecycle.append(item)
+    never_started = (len(lifecycle) == 1 and lifecycle[0].get('event') == 'deferred'
+                     and lifecycle[0].get('phase') == 'admission'
+                     and lifecycle[0].get('admitted') is False
+                     and lifecycle[0].get('workload_started') is False)
     if result.returncode:
-        resource = (result.returncode not in {1, 2} or any(s in text.lower() for s in
+        resource = (result.returncode not in {1, 2, 75} or any(s in text.lower() for s in
                     ('out of memory', 'heap out of memory', 'killed process', 'timed out',
-                     'guarded-run: refusing', 'guarded-run: deferred', 'prepare exited', 'environment not ready',
+                     'guarded-run: refusing', 'prepare exited', 'environment not ready',
                      "['npm', 'ci'"))
                     or bool(re.search(r'"oom(?:_kill)?"\s*:\s*[1-9]', text)))
-        source = not resource and bool(re.search(r'error TS\d+|FAIL |AssertionError|AssertionError:|Failed to resolve import|Failed to load url|Cannot find module', text))
-        raise CheckFailed(f'check exited {result.returncode}: {log}; resource/unknown failures are not retried', source=source)
+        source = not resource and result.returncode in {1, 2} and (
+            bool(re.search(r'error TS\d+|FAIL |AssertionError|Failed to resolve import|Failed to load url|Cannot find module', text))
+            or isinstance(data, dict) and (data.get('numFailedTests', 0) > 0
+                                          or data.get('numFailedTestSuites', 0) > 0))
+        kind = ('deferred' if result.returncode == 75 and never_started else
+                'resource_failure' if resource else 'source_failure' if source else 'infrastructure_failure')
+        raise CheckFailed(f'check exited {result.returncode} ({kind}): {log}; no resource retry',
+                          source=source, kind=kind)
+    if report is not None and (not isinstance(data, dict) or data.get('success') is not True
+                               or data.get('numTotalTests', 0) <= 0 or data.get('numFailedTests') != 0):
+        raise CheckFailed('native test report has no successful executed cases: ' + str(report),
+                          kind='contract_failure')
     return {'command': command, 'exit': 0, 'log': str(log), 'sha256': sha256(log)}
 
 
@@ -278,7 +337,13 @@ def ci_requirements(root, current):
 
 
 def verify_local(root, current, manifest, run):
-    ui_required = any(Path(path).suffix in {'.vue', '.css', '.scss', '.sass', '.less'} for path in current['paths'])
+    if 'review' in manifest:
+        try:
+            validate_review(root, manifest['review'], current['paths'], load_context(root))
+        except RuntimeError as error:
+            raise CheckFailed(str(error), source=True) from error
+    ui_required = manifest['ui'].get('required') is True or any(
+        Path(path).suffix in {'.vue', '.css', '.scss', '.sass', '.less'} for path in current['paths'])
     ui = manifest['ui']
     if ui_required and (ui.get('required') is not True or ui.get('status') != 'verified' or not ui.get('scenarios') or not ui.get('screenshots')):
         raise RuntimeError('changed UI requires actual owned runtime scenarios/screenshots; static review is not proof')
@@ -311,7 +376,7 @@ def verify_local(root, current, manifest, run):
         report = run / f'test-{number}.json'
         command = [*command, '--reporter=json', '--outputFile=' + str(report)]
         guarded = [str(GUARD), '--need', '3G', '--wait', '60', '--exclusive-key', str(root), '--', *command]
-        proofs.append(checked(root, guarded, run / f'test-{number}.log', env))
+        proofs.append(checked(root, guarded, run / f'test-{number}.log', env, report=report))
         data = json.loads(report.read_text())
         if data.get('success') is not True or data.get('numTotalTests', 0) <= 0 or data.get('numFailedTests') != 0:
             raise RuntimeError('native test report has no successful executed cases: ' + str(report))
@@ -325,6 +390,13 @@ def verify_local(root, current, manifest, run):
 def render_report(root, manifest, proof):
     lines = ['# Feature refactor report', '',
              'Source HEAD: `' + proof['source']['head'] + '`; content: `' + proof['source']['source_key'] + '`.', '']
+    if 'review' in manifest:
+        lines += ['## Область review и направление изменений', '']
+        for scope in manifest['review']['coverage']:
+            lines += ['- ' + scope['scenario'] + ': ' + ', '.join(scope['paths'])]
+            for comparison in scope['comparisons']:
+                lines += ['  - ' + comparison['direction'] + ': ' + comparison['decision']]
+        lines.append('')
     for title, key in (('Исправлено', 'fixed'), ('Передать backend', 'backend'), ('Ограничения', 'warnings')):
         lines += ['## ' + title, '']
         for item in manifest[key]:
@@ -348,7 +420,7 @@ def render_report(root, manifest, proof):
         if not image.is_absolute():
             image = root / image
         lines.append('- [' + str(image) + '](<' + image.as_uri() + '>)')
-    lines += ['', '## Доставка', '', 'Pending: требуется exact-SHA MR CI и подтверждённый merge в dev.', '']
+    lines += ['', '## Доставка', '', 'Pending: требуется открытый MR и exact-SHA CI; merge отдельно не подразумевается.', '']
     return '\n'.join(lines)
 
 
@@ -392,9 +464,67 @@ def owner_opt_out(root, current, path, manifest_path, reason):
     save(path / 'receipt.json', receipt_for(current, key, run / 'verification.json'))
 
 
-def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, manifest=None, reason=None):
+def ensure_manual_merge(root, mr):
+    if mr.get('merge_when_pipeline_succeeds') is True or mr.get('auto_merge_enabled') is True:
+        forge = Forge(root)
+        subprocess.run([forge.binary, 'api', '--method', 'POST',
+                        f'projects/:id/merge_requests/{mr["iid"]}/cancel_merge_when_pipeline_succeeds'],
+                       cwd=root, check=True, stdout=subprocess.PIPE, timeout=60)
+        mr = forge.mr(mr['iid'])
+    if mr.get('merge_when_pipeline_succeeds') is not False or mr.get('auto_merge_enabled', False) is not False:
+        raise RuntimeError('cannot confirm auto-merge disabled; no unattended delivery')
+    return mr
+
+
+def needs_ui(current, manifest):
+    ui = manifest['ui']
+    required = ui.get('required') is True or any(
+        Path(name).suffix in {'.vue', '.css', '.scss', '.sass', '.less'} for name in current['paths'])
+    return required and (ui.get('required') is not True or ui.get('status') != 'verified'
+                         or ui.get('source_key') != current['source_key']
+                         or not ui.get('scenarios') or not ui.get('screenshots'))
+
+
+def await_ui(root, run, key, attempt, post_commit=False, phase='awaiting_ui'):
+    artifacts = {name: sha256(run / name) for name in
+                 ('source.json', 'feature.diff', 'refactor.md', 'review-context.json', 'plan.md', 'implementation.json')}
+    state = {'schema': 1, 'phase': phase, 'root': str(root),
+             'source': snapshot(root, allow_dirty=True), 'policy': key,
+             'attempt': attempt, 'post_commit': post_commit, 'artifacts': artifacts}
+    save(run / 'state.json', state)
+    command = ['wt', 'finalize', '--', '--resume', str(run)]
+    if phase == 'awaiting_ui':
+        command += ['--ui-proof', str(run / 'ui-proof.json')]
+    print(json.dumps({'state': phase, 'run': str(run), 'resume': command,
+                      'required': ('Owned UI scenarios/screenshots on this exact source.'
+                                   if phase == 'awaiting_ui' else 'Resource admission; workload never started.'),
+                      'delivery': 'pending; no delivery yet'}), flush=True)
+    return 0
+
+
+def load_resume(root, path, requested, current, key):
+    run = Path(requested).absolute()
+    if run.parent != path or any(p.is_symlink() for p in (run, *run.parents)):
+        raise RuntimeError('resume requires an owned direct run directory, without symlinks')
+    state = json.loads((run / 'state.json').read_text())
+    if (state.get('schema') != 1 or state.get('phase') not in {'awaiting_ui', 'awaiting_checks'}
+            or state.get('root') != str(root) or state.get('source') != current or state.get('policy') != key
+            or state.get('attempt') not in (0, 1) or not isinstance(state.get('post_commit'), bool)):
+        raise RuntimeError('resume source/policy/state drift; failed or running attempts cannot be replayed')
+    expected = {'source.json', 'feature.diff', 'refactor.md', 'review-context.json', 'plan.md', 'implementation.json'}
+    if set(state.get('artifacts', {})) != expected or any(
+            (run / name).is_symlink() or sha256(run / name) != digest
+            for name, digest in state['artifacts'].items()):
+        raise RuntimeError('resume artifact drift; no stale phase reuse')
+    return run, state
+
+
+def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, manifest=None, reason=None,
+           merge=False, sessions=None, resume=None, ui_proof=None):
+    if (resume and skip_sol) or (ui_proof and not resume):
+        raise RuntimeError('--ui-proof requires --resume; --resume cannot change the Sol opt-out contract')
     root = owned_root(root)
-    initial = snapshot(root)
+    initial = snapshot(root, allow_dirty=bool(resume))
     if dry_run:
         print(json.dumps({'branch': initial['branch'], 'source': initial, 'hotfix': hotfix(initial['branch']),
                           'model': MODEL, 'thinking': 'high', 'service_tier': 'priority',
@@ -402,57 +532,94 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
                           'current_receipt': current_receipt(root, initial),
                           'required_ci': sorted(ci_requirements(root, initial)),
                           'plan_command': agent_command(root, [], True),
-                          'delivery': 'wt push -> exact-SHA MR CI -> merge -> safe remote cleanup; local worktree preserved'}, ensure_ascii=False))
+                          'merge': merge, 'owner_context': str(context_path(root)),
+                          'delivery': 'wt push -> open MR -> exact-SHA CI -> ' +
+                                      ('explicit merge -> safe cleanup' if merge else 'STOP; no merge, auto-merge disabled, source preserved')}, ensure_ascii=False))
         return 0
+    if sessions:
+        store_context(root, sessions)
+    load_context(root)
     path = directory(root)
     with lock(path):
         refresh(root)
-        initial = snapshot(root)
+        initial = snapshot(root, allow_dirty=bool(resume))
         if not initial['paths']:
             raise RuntimeError('feature diff is empty; no new feature to finalize')
         mr = find_mr(root, initial['branch'], iid)
         if mr:
             validate_mr(mr, initial['branch'], mr['sha'])
+            mr = ensure_manual_merge(root, mr)
             subprocess.run(['git', 'fetch', 'origin', 'refs/heads/' + initial['branch']], cwd=root, check=True)
             subprocess.run(['git', 'merge-base', '--is-ancestor', mr['sha'], initial['head']], cwd=root, check=True)
         if skip_sol:
             owner_opt_out(root, initial, path, manifest, reason)
         if not current_receipt(root, initial):
-            run = path / (str(time.time_ns()) + '-' + initial['head'][:12])
-            run.mkdir(mode=0o700)
-            inputs = feature_diff(root, initial)
-            if len(inputs) > MAX_INPUT:
-                raise RuntimeError('full feature diff exceeds the reviewed input bound; split/review explicitly, never truncate')
-            (run / 'feature.diff').write_bytes(inputs)
-            (run / 'source.json').write_text(json.dumps(initial, indent=2))
-            (run / 'refactor.md').write_bytes((root / '.claude/commands/refactor.md').read_bytes())
-            prompt = (HERE / 'finalize-prompt.md').read_text()
-            (run / 'plan-request.md').write_text(prompt + '\n\nPHASE: PLAN ONLY. Read tools only. Return a concrete refactor plan, findings, backend handoffs and exact native test selections. Do not ask for approval: the owner approved this feature finalization scope. Do not modify code.\n')
             key = policy_key(root)
-            run_agent(root, [run / 'plan-request.md', run / 'source.json', run / 'feature.diff', run / 'refactor.md'], run / 'plan.md', True)
-            if snapshot(root) != initial or policy_key(root) != key:
-                raise RuntimeError('plan phase changed source/policy; stop rather than review mixed revisions')
-            for attempt in range(2):
-                (run / 'implement-request.md').write_text(prompt + '\n\nPHASE: IMPLEMENT. Apply the saved plan and exercise any changed UI through owned wt ui. Do not run unit tests/typecheck, commit, push or merge: the controller does these after you exit. Never edit .gitlab-ci.yml or workflow helpers. Save the complete JSON manifest at ' + str(run / 'implementation.json') + '. All code edits must be unstaged. Prior attempt diagnostics, if any, are in ' + str(run) + '.\n')
-                phase_head = git(root, 'rev-parse', 'HEAD')
-                run_agent(root, [run / 'implement-request.md', run / 'source.json', run / 'feature.diff', run / 'refactor.md', run / 'plan.md'], run / f'implementation-{attempt}.log', False)
-                if git(root, 'rev-parse', 'HEAD') != phase_head:
-                    raise RuntimeError('implementation must not create commits; source identity changed')
+            prompt = (HERE / 'finalize-prompt.md').read_text() + '\n\n' + (HERE / 'review-contract.md').read_text()
+            resumed, post_commit, start_attempt = bool(resume), False, 0
+            if resumed:
+                run, saved = load_resume(root, path, resume, initial, key)
+                start_attempt, post_commit = saved['attempt'], saved['post_commit']
+                manifest = json.loads((run / 'implementation.json').read_text())
+                if ui_proof:
+                    proof_path = Path(ui_proof).absolute()
+                    if not proof_path.resolve().is_relative_to(root / '.superpowers') or proof_path.is_symlink():
+                        raise RuntimeError('UI proof must be an owned local artifact')
+                    supplied = json.loads(proof_path.read_text())
+                    if set(supplied) - {'ui', 'review'} or 'ui' not in supplied:
+                        raise RuntimeError('UI proof may update only ui and its source-bound review')
+                    manifest.update(supplied)
+            else:
+                run = path / (str(time.time_ns()) + '-' + initial['head'][:12])
+                run.mkdir(mode=0o700)
+                inputs = feature_diff(root, initial)
+                if len(inputs) > MAX_INPUT:
+                    raise RuntimeError('full feature diff exceeds the reviewed input bound; never truncate')
+                (run / 'feature.diff').write_bytes(inputs)
+                save(run / 'source.json', initial)
+                (run / 'refactor.md').write_bytes((root / '.claude/commands/refactor.md').read_bytes())
+                (run / 'review-context.json').write_bytes(context_path(root).read_bytes())
+                (run / 'plan-request.md').write_text(prompt + '\n\nPHASE: PLAN ONLY. Read tools only. Return a concrete refactor plan, findings, backend handoffs and exact native test selections. Do not modify code.\n')
+                save(run / 'state.json', {'phase': 'plan_running'})
+                run_agent(root, [run / 'plan-request.md', run / 'source.json', run / 'feature.diff', run / 'refactor.md',
+                                 run / 'review-context.json'], run / 'plan.md', True)
+                if snapshot(root) != initial or policy_key(root) != key:
+                    raise RuntimeError('plan phase changed source/policy; stop rather than review mixed revisions')
+            for attempt in range(start_attempt, 2):
+                if not resumed:
+                    (run / 'implementation.json').unlink(missing_ok=True)
+                    save(run / 'state.json', {'phase': 'source_running', 'attempt': attempt})
+                    (run / 'implement-request.md').write_text(prompt + '\n\nPHASE: IMPLEMENT SOURCE ONLY. Apply the saved plan. Do not start browsers, unit tests/typecheck, commit, push or merge. Controller/main owns subsequent checks and UI. Never edit .gitlab-ci.yml or workflow helpers. Save the complete JSON manifest at ' + str(run / 'implementation.json') + '. Include source_key from feature-finalize --source-key after all edits. UI evidence not already valid for these bytes must be pending, not verified. Leave edits unstaged. Prior diagnostics are in ' + str(run) + '.\n')
+                    phase_head = git(root, 'rev-parse', 'HEAD')
+                    run_agent(root, [run / 'implement-request.md', run / 'source.json', run / 'feature.diff', run / 'refactor.md',
+                                     run / 'review-context.json', run / 'plan.md'], run / f'implementation-{attempt}.log', False)
+                    if git(root, 'rev-parse', 'HEAD') != phase_head:
+                        raise RuntimeError('implementation must not create commits; source identity changed')
+                    manifest = json.loads((run / 'implementation.json').read_text())
+                    post_commit = False
+                resumed = False
                 if policy_key(root) != key or git(root, 'diff', '--cached', '--name-only'):
                     raise RuntimeError('implementation changed policy or staged paths outside controller')
-                manifest = json.loads((run / 'implementation.json').read_text())
-                validate_manifest(root, manifest, changed_paths(root))
+                if not post_commit:
+                    validate_manifest(root, manifest, changed_paths(root))
                 if '.gitlab-ci.yml' in changed_paths(root):
                     raise RuntimeError('refactor must not change server-side CI')
                 pending = snapshot(root, allow_dirty=True)
+                save(run / 'implementation.json', manifest)
+                if needs_ui(pending, manifest):
+                    return await_ui(root, run, key, attempt, post_commit)
+                validate_review(root, manifest.get('review'), pending['paths'], load_context(root))
+                save(run / 'state.json', {'phase': 'checks_running', 'attempt': attempt})
                 try:
-                    checks = run / f'checks-{attempt}-before-commit'
+                    checks = run / (f'checks-{attempt}-' + str(time.time_ns()))
                     checks.mkdir()
                     save(checks / 'implementation.json', manifest)
                     proof = verify_local(root, pending, manifest, checks)
                     if snapshot(root, allow_dirty=True) != pending or policy_key(root) != key:
                         raise RuntimeError('checked inputs changed during verification; no stale receipt')
-                    commit_topics(root, manifest)
+                    if not post_commit:
+                        commit_topics(root, manifest)
+                    post_commit = True
                     # Existing explicit batches retain their cumulative hook gate.
                     state = root / '.superpowers/batch/state.json'
                     if state.exists():
@@ -466,22 +633,29 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
                             raise RuntimeError('batch verification failed; inspect evidence, no resource retry or hook bypass')
                     current = snapshot(root)
                     if current['source_key'] != pending['source_key']:
+                        if needs_ui(current, manifest):
+                            return await_ui(root, run, key, attempt, post_commit=True)
                         checks = run / f'checks-{attempt}-after-hooks'
                         checks.mkdir()
                         save(checks / 'implementation.json', manifest)
                         proof = verify_local(root, current, manifest, checks)
                     proof['source'] = current
                 except CheckFailed as failure:
+                    if failure.kind == 'deferred':
+                        return await_ui(root, run, key, attempt, post_commit, phase='awaiting_checks')
+                    save(run / 'state.json', {'phase': 'failed', 'kind': failure.kind, 'attempt': attempt})
                     if not failure.source or attempt == 1:
                         raise
                     (run / 'source-failure.txt').write_text(str(failure))
                     print('feature-finalize: source check failed; one bounded correction pass, no resource retry', flush=True)
+                    post_commit = False
                     continue
                 if snapshot(root) != current or policy_key(root) != key:
                     raise RuntimeError('checked inputs changed during final hooks; no stale receipt')
                 (run / 'report.md').write_text(render_report(root, manifest, proof))
                 save(run / 'verification.json', proof)
                 save(path / 'receipt.json', receipt_for(current, key, run / 'verification.json'))
+                save(run / 'state.json', {'phase': 'verified', 'source': current, 'policy': key})
                 print('feature-finalize: refactor report: ' + str(run / 'report.md'), flush=True)
                 break
         current = snapshot(root)
@@ -499,10 +673,26 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
         if mr is None:
             raise RuntimeError('MR creation did not yield an unambiguous open MR')
         validate_mr(mr, current['branch'], current['head'])
+        mr = ensure_manual_merge(root, mr)
         ci = wait_for_ci(root, mr['iid'], current['branch'], current['head'], ci_requirements(root, current))
         save(path / 'ci.json', ci)
-        if snapshot(root) != current:
-            raise RuntimeError('source/target changed before merge; review again')
+        if snapshot(root) != current or not current_receipt(root, current):
+            raise RuntimeError('source/target/owner context changed before delivery; review again')
+        if not merge:
+            mr = ensure_manual_merge(root, Forge(root).mr(mr['iid']))
+            validate_mr(mr, current['branch'], current['head'])
+            delivery = {'state': 'mr-ready', 'mr': mr['iid'], 'sha': current['head'],
+                        'target': 'dev', 'url': mr.get('web_url'), 'source_preserved': True,
+                        'auto_merge': False, 'ci': ci, 'review_receipt': str(path / 'receipt.json')}
+            save(path / 'delivery.json', delivery)
+            receipt = json.loads((path / 'receipt.json').read_text())
+            report = Path(receipt['verification']).parent / 'report.md'
+            report.write_text(report.read_text().rsplit('## Доставка', 1)[0] +
+                              '## Доставка\n\nMR !' + str(mr['iid']) +
+                              ' открыт; merge не выполнялся. Auto-merge выключен, source сохранён. SHA `' +
+                              current['head'] + '`, exact-SHA CI подтверждён.\n')
+            print(json.dumps(delivery, ensure_ascii=False))
+            return 0
         subprocess.run(['wt', 'mr', '--', 'merge', str(mr['iid']), '--sha=' + current['head'], '--yes',
                         *(['--keep-source-branch'] if keep_source else [])], cwd=root, check=True)
         merged = Forge(root).mr(mr['iid'])
@@ -533,18 +723,24 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mr', type=int)
+    parser.add_argument('--merge', action='store_true', help='only after a separate explicit owner instruction to merge')
+    parser.add_argument('--session', type=Path, action='append', help='originating owner transcript; repeat for explicit parent lineage')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--source-key', action='store_true', help='read-only runtime source content fingerprint')
     parser.add_argument('--keep-source-branch', action='store_true', help='preserve remote source after merge')
     parser.add_argument('--skip-sol', action='store_true', help='only for an explicit owner opt-out; native checks still required')
     parser.add_argument('--manifest', type=Path, help='native test/UI selections for --skip-sol')
     parser.add_argument('--reason', help='verbatim owner reason/request to skip Sol')
+    parser.add_argument('--resume', type=Path, help='continue an unchanged awaiting_ui run; never replay failed workloads')
+    parser.add_argument('--ui-proof', type=Path, help='owned JSON with source-bound ui and optional refreshed review')
     args = parser.parse_args()
     root = Path(git(Path.cwd(), 'rev-parse', '--show-toplevel'))
     if args.source_key:
         print(source_key(owned_root(root)))
         return 0
-    return finish(root, args.mr, args.dry_run, args.keep_source_branch, args.skip_sol, args.manifest, args.reason)
+    return finish(root, args.mr, args.dry_run, args.keep_source_branch, args.skip_sol,
+                  args.manifest, args.reason, merge=args.merge, sessions=args.session,
+                  resume=args.resume, ui_proof=args.ui_proof)
 
 
 if __name__ == '__main__':

@@ -9,25 +9,25 @@ env = "/home/q/.config/worktrunk/projects/p2p-frontend/pre-start-env {{ branch }
 
 [projects."gitlab.psclp.org/common/frontend/frontend".aliases]
 # GitLab MR with apiBase guard; GitLab only — never `wt merge` for p2p.
-mr = "/home/q/.config/worktrunk/projects/p2p-frontend/mr {{ args }}"
+mr = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain /home/q/.config/worktrunk/projects/p2p-frontend/mr {{ args }}"
 # Ordinary commits stay strict; an explicit batch defers reviewed pre-commit tasks.
-commit = "sh /home/q/.config/worktrunk/projects/p2p-frontend/commit {{ args }}"
-batch = "/home/q/.config/worktrunk/projects/p2p-frontend/batch {{ args }}"
-push = "sh /home/q/.config/worktrunk/projects/p2p-frontend/push {{ args }}"
-stand = "python3 /home/q/.config/worktrunk/projects/p2p-frontend/stand {{ args }}"
-# One explicit feature delivery: Sol high plan/refactor, native checks, push and exact-SHA MR merge.
-finalize = "python3 /home/q/.config/worktrunk/projects/p2p-frontend/feature-finalize {{ args }}"
+commit = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain sh /home/q/.config/worktrunk/projects/p2p-frontend/commit {{ args }}"
+batch = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain /home/q/.config/worktrunk/projects/p2p-frontend/batch {{ args }}"
+push = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain sh /home/q/.config/worktrunk/projects/p2p-frontend/push {{ args }}"
+stand = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain python3 /home/q/.config/worktrunk/projects/p2p-frontend/stand {{ args }}"
+# Sol high plan/refactor and exact-SHA CI; stop at open MR unless --merge.
+finalize = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain python3 /home/q/.config/worktrunk/projects/p2p-frontend/feature-finalize {{ args }}"
 
 # Finite capped dev server; still tethered to this worktree.
-dev = "wt step tether -- sh /home/q/.config/worktrunk/projects/p2p-frontend/dev-server {{ branch | hash_port }} {{ args }}"
+dev = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain wt step tether -- sh /home/q/.config/worktrunk/projects/p2p-frontend/dev-server {{ branch | hash_port }} {{ args }}"
 
 # `wt deps` — explicit on-demand `npm ci`; editing a worktree never needs it,
 # so it is not a hook and never gates worktree creation.
-deps = "sh /home/q/.config/worktrunk/projects/deps-bootstrap {{ args }}"
-env = "/home/q/.config/worktrunk/projects/project-environment {{ args }}"
-ui = "/home/q/.config/worktrunk/projects/ui-session {{ args }}"
+deps = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain sh /home/q/.config/worktrunk/projects/deps-bootstrap {{ args }}"
+env = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain /home/q/.config/worktrunk/projects/project-environment {{ args }}"
+ui = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain /home/q/.config/worktrunk/projects/ui-session {{ args }}"
 # Native app typecheck, fixed guarded budget and measured elapsed/peak RSS.
-typecheck = "python3 /home/q/.config/worktrunk/projects/p2p-frontend/typecheck {{ args }}"
+typecheck = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain python3 /home/q/.config/worktrunk/projects/p2p-frontend/typecheck {{ args }}"
 
 # Ecom is a separate project (own remote identity, own app set, own stand).
 # It deliberately has no cascade .env pre-start hook: p2p's NUXT_PUBLIC_API_BASE

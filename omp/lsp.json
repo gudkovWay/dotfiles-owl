@@ -1,0 +1,21 @@
+{
+  "servers": {
+    "typescript-language-server": {
+      "command": "/home/q/.local/share/nvim/mason/bin/typescript-language-server",
+      "args": ["--stdio"],
+      "fileTypes": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue"],
+      "rootMarkers": ["package.json", "tsconfig.json", "jsconfig.json"],
+      "initOptions": {
+        "disableAutomaticTypingAcquisition": true,
+        "plugins": [{
+          "name": "@vue/typescript-plugin",
+          "location": "/home/q/.local/share/nvim/mason/packages/vue-language-server/node_modules/@vue/typescript-plugin",
+          "languages": ["vue"]
+        }]
+      }
+    },
+    "vue-language-server": {
+      "disabled": true
+    }
+  }
+}

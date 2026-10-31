@@ -17,7 +17,7 @@ import time
 import uuid
 
 from resource_policy import (
-    GuardError, Busy, MAX_JOBS, CPU_COUNT, PARENT_PIDS,
+    GuardError, Busy, MAX_JOBS, CPU_COUNT, PARENT_PIDS, DEFAULT_TASKS, admit_tasks,
     available_budget, reservation_headroom, admission, allocate_memory,
 )
 
@@ -33,7 +33,7 @@ ACTIVE = {'active', 'activating', 'deactivating', 'reloading'}
 HEAVY = {'vitest', 'playwright', 'jest', 'pytest', 'vue-tsc', 'nuxt', 'nuxi',
          'esbuild', 'tsc', 'cargo', 'vite', 'rollup', 'node-gyp', 'cmake', 'ninja', 'make'}
 COMMON = (f'CPUQuota={CPU_COUNT * 100}%', 'CPUWeight=20', 'MemorySwapMax=0',
-          'TasksMax=256', 'IOWeight=20')
+          'IOWeight=20')
 
 
 
@@ -122,8 +122,15 @@ def validate_state(state):
         if not fields.issubset(job) or not set(job).issubset(fields | {
                 'runtime', 'memory_high', 'policy_version', 'ceiling', 'elastic',
                 'pending_limit', 'pending_high', 'started_at', 'workload', 'last_reclaim',
-                'last_sample', 'last_usage', 'goal', 'peak', 'deadline'}):
+                'last_sample', 'last_usage', 'goal', 'peak', 'deadline',
+                'tasks', 'pids_peak', 'pids_events'}):
             raise GuardError('invalid resource registry reservation')
+        tasks = job.get('tasks', DEFAULT_TASKS)
+        if type(tasks) is not int or not 1 <= tasks <= PARENT_PIDS:
+            raise GuardError('invalid resource registry task cap')
+        for metric in ('pids_peak', 'pids_events'):
+            if metric in job and (type(job[metric]) is not int or job[metric] < 0):
+                raise GuardError('invalid resource registry PID metric')
         runtime = job.get('runtime', DEFAULT_RUNTIME)
         if runtime != 'infinity' and (type(runtime) is not int or not 1 <= runtime <= 28800):
             raise GuardError('invalid resource registry runtime')
@@ -155,15 +162,21 @@ def validate_state(state):
             raise GuardError('invalid resource registry environment keys')
     if sum(max(job['limit'], job.get('pending_limit', 0)) for job in jobs.values()) > state['budget']:
         raise GuardError('resource registry is overcommitted')
+    if sum(job.get('tasks', DEFAULT_TASKS) for job in jobs.values()) > PARENT_PIDS:
+        raise GuardError('resource registry PID budget is overcommitted')
     for field in ('queue',):
         entries = state.get(field, [])
         if not isinstance(entries, list) or len(entries) > 128:
             raise GuardError('invalid admission queue')
         identities = set()
         for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {
-                    'id', 'pid', 'start', 'goal', 'enqueued_at', 'deadline', 'required', 'keys'}:
+            if not isinstance(entry, dict) or not {
+                    'id', 'pid', 'start', 'goal', 'enqueued_at', 'deadline', 'required', 'keys'
+            }.issubset(entry) or set(entry) - {
+                    'id', 'pid', 'start', 'goal', 'enqueued_at', 'deadline', 'required', 'keys', 'tasks'}:
                 raise GuardError('invalid admission queue entry')
+            if type(entry.get('tasks', DEFAULT_TASKS)) is not int or not 1 <= entry.get('tasks', DEFAULT_TASKS) <= PARENT_PIDS:
+                raise GuardError('invalid queued task cap')
             if not isinstance(entry['id'], str) or not SCOPE_RE.fullmatch(entry['id']) or entry['id'] in identities:
                 raise GuardError('invalid queue identity')
             identities.add(entry['id'])
@@ -182,11 +195,14 @@ def validate_state(state):
         if not re.fullmatch('[a-f0-9]{64}', digest) or not isinstance(entries, list) or len(entries) > 20:
             raise GuardError('invalid workload history entry')
         for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {'seconds', 'peak', 'exit'} or (
+            if not isinstance(entry, dict) or not {'seconds', 'peak', 'exit'}.issubset(entry) or set(entry) - {'seconds', 'peak', 'exit', 'pids_peak', 'pids_events'} or (
                     type(entry['seconds']) not in (int, float) or not math.isfinite(entry['seconds']) or
                     entry['seconds'] < 0 or type(entry['peak']) is not int or entry['peak'] < 0 or
                     (entry['exit'] is not None and type(entry['exit']) is not int)):
                 raise GuardError('invalid workload measurement')
+            for metric in ('pids_peak', 'pids_events'):
+                if metric in entry and (type(entry[metric]) is not int or entry[metric] < 0):
+                    raise GuardError('invalid workload PID measurement')
 
 
 class Registry:
@@ -292,19 +308,31 @@ class Systemd:
                 raise GuardError(f'invalid scope population: {unit}')
         return info['ActiveState'] in ACTIVE
 
-    def memory_usage(self, unit):
+    def scope_root(self, unit):
         info = self.info(unit)
-        if not info.get('ControlGroup'):
-            if info['ActiveState'] not in ACTIVE:
-                return 0  # Durable, not-yet-started reservation uses full headroom.
-            raise GuardError('active scope has no memory accounting: ' + unit)
-        root = cgroup_root(info['ControlGroup'])
+        if info.get('ControlGroup'):
+            root = cgroup_root(info['ControlGroup'])
+            if (root / 'memory.current').exists():
+                return root
+            info = self.info(unit)
+        if info['ActiveState'] not in ACTIVE and not info.get('ControlGroup'):
+            return None
+        raise GuardError('live scope accounting unavailable: ' + unit)
+
+    def memory_usage(self, unit):
+        root = self.scope_root(unit)
+        if root is None:
+            return 0
         try:
             current = int((root / 'memory.current').read_text())
             stats = dict(line.split() for line in (root / 'memory.stat').read_text().splitlines())
             # Reclaimable cache is not guaranteed consumed reservation space.
             cache = max(0, int(stats['file']) - int(stats['shmem'])) + int(stats['slab_reclaimable'])
             return max(0, current - cache)
+        except FileNotFoundError as exc:
+            if self.scope_root(unit) is None:
+                return 0
+            raise GuardError('live memory accounting unavailable: ' + unit) from exc
         except (OSError, ValueError, KeyError) as exc:
             raise GuardError('live memory accounting unavailable: ' + unit) from exc
 
@@ -350,7 +378,7 @@ def runtime_matches(value, seconds):
     return sum(int(n)*units[unit] for n, unit in parts) == seconds*1000000
 
 
-def verify_caps(backend, unit, memory, timed, runtime=DEFAULT_RUNTIME, memory_high=None, policy_version=1):
+def verify_caps(backend, unit, memory, timed, runtime=DEFAULT_RUNTIME, memory_high=None, policy_version=1, tasks=DEFAULT_TASKS):
     info = backend.info(unit)
     if info['ActiveState'] not in ACTIVE or not info.get('ControlGroup'):
         raise GuardError(f'resource cgroup is not active: {unit}')
@@ -359,9 +387,9 @@ def verify_caps(backend, unit, memory, timed, runtime=DEFAULT_RUNTIME, memory_hi
         high = memory * 2 // 3 if memory_high is None else memory_high
         if not timed and policy_version == 2:
             high = memory
-        pids = PARENT_PIDS if not timed and policy_version == 2 else 256
+        expected_tasks = PARENT_PIDS if not timed and policy_version == 2 else tasks
         for name, expected in {'memory.high': high, 'memory.max': memory,
-                               'memory.swap.max': 0, 'pids.max': pids}.items():
+                               'memory.swap.max': 0, 'pids.max': expected_tasks}.items():
             actual = (root / name).read_text().strip()
             # Kernel rounds memory byte thresholds to pages, not task counts.
             if name in {'memory.high', 'memory.max'}:
@@ -391,7 +419,8 @@ def context_from_state(state, backend, relative):
     version = job.get('policy_version', 1)
     scope = verify_caps(backend, unit, job['limit'], True,
                         runtime=job.get('runtime', DEFAULT_RUNTIME),
-                        memory_high=job.get('memory_high'), policy_version=version)
+                        memory_high=job.get('memory_high'), policy_version=version,
+                        tasks=job.get('tasks', DEFAULT_TASKS))
     parent = verify_caps(backend, SLICE, state['budget'], False,
                          policy_version=state.get('policy_version', 1))
     if not scope.startswith(parent + '/') or not (relative == scope or relative.startswith(scope + '/')):
@@ -494,10 +523,10 @@ def mem_available():
     return int(match[1]) * 1024
 
 
-def scope_command(unit, limit, command, options, runtime=DEFAULT_RUNTIME, memory_high=None):
+def scope_command(unit, limit, command, options, runtime=DEFAULT_RUNTIME, memory_high=None, tasks=DEFAULT_TASKS):
     duration = 'infinity' if runtime == 'infinity' else f'{runtime}s'
     high = limit * 2 // 3 if memory_high is None else memory_high
-    properties = (*COMMON, f'MemoryHigh={high}', f'MemoryMax={limit}',
+    properties = (*COMMON, f'TasksMax={tasks}', f'MemoryHigh={high}', f'MemoryMax={limit}',
                   f'RuntimeMaxSec={duration}', 'OOMPolicy=kill')
     return ['systemd-run', '--user', '--scope', f'--unit={unit}', '--collect',
             f'--slice={SLICE}', '--expand-environment=no',
@@ -575,6 +604,7 @@ def main():
     parser.add_argument('--memory', type=parse_memory, metavar='SIZE',
                         help='exact fixed maximum; omitted uses expected memory plus a dynamic buffer')
     parser.add_argument('--need', type=parse_memory, help='expected peak RAM, before the dynamic buffer')
+    parser.add_argument('--tasks', type=int, help='fixed process/thread cap, reserved within parent budget')
     parser.add_argument('--elastic', action='store_true', help='permit admitted live growth before OOM')
     parser.add_argument('--ceiling', type=parse_memory, help='elastic authority ceiling, not a reservation')
     parser.add_argument('--goal-ticket', help='broker-issued descendant ticket file')
@@ -587,6 +617,8 @@ def main():
     parser.add_argument('--approved-no-timeout', action='store_true',
                         help='after explicit owner approval for this build, disable only its runtime timeout')
     parser.add_argument('--wait', type=int, default=60, metavar='SECONDS')
+    parser.add_argument('--admission-windows', type=int, choices=(1, 2), default=1,
+                        help='bounded pre-exec admission windows; never retries a started workload')
     parser.add_argument('--exclusive-key', metavar='PATH')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--check-inside', action='store_true')
@@ -594,6 +626,8 @@ def main():
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     explicit_memory = args.memory is not None
+    if args.tasks is not None:
+        admit_tasks({'jobs': {}}, args.tasks)
     if args.status:
         registry = Registry()
         with registry.lock():
@@ -631,6 +665,8 @@ def main():
         with registry.lock():
             nested_job = registry.load()['jobs'][unit]
             limit = nested_job.get('ceiling', nested_job['limit']) if nested_job.get('elastic') else nested_job['limit']
+        if args.tasks is not None and args.tasks > nested_job.get('tasks', DEFAULT_TASKS):
+            raise GuardError('nested command cannot increase its task cap')
         if (explicit_memory and args.memory > limit) or (args.need and args.need > limit):
             raise GuardError('nested command cannot increase its reservation')
         validate_node_command(command, limit)
@@ -642,6 +678,7 @@ def main():
             reserve_environment(args.exclusive_key, args.wait)
         os.environ['NODE_OPTIONS'] = options
         print('guarded-run: cgroup caps verified; ' + unit, flush=True)
+        print(json.dumps(dict(event='workload_start', job_id=unit, workload_started=True)), flush=True)
         os.execvp(command[0], command)
     if args.dry_run:
         available = mem_available()
@@ -653,7 +690,8 @@ def main():
               f'maximum={limit}; soft={high}; node-heap={options.rsplit("=", 1)[1]}MiB; '
               f'runtime={duration}; max-jobs={MAX_JOBS}; admission unverified')
         print(shlex.join(scope_command('omp-heavy-job-' + uuid.uuid4().hex + '.scope', limit,
-                                      command, options, args.runtime, memory_high=high)))
+                                      command, options, args.runtime, memory_high=high,
+                                      tasks=args.tasks or DEFAULT_TASKS)))
         return 0
     return execute(args, command, options)
 

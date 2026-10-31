@@ -10,6 +10,16 @@ MAX_JOBS = 8
 HOST_FLOOR = GIB
 CPU_COUNT = max(1, (os.cpu_count() or 2) - 2)
 PARENT_PIDS = MAX_JOBS * 256
+DEFAULT_TASKS = 256
+UI_TASKS = 512
+
+
+def admit_tasks(state, requested):
+    if type(requested) is not int or not 1 <= requested <= PARENT_PIDS:
+        raise GuardError('invalid task cap; must be within parent PID budget')
+    promised = sum(job.get('tasks', DEFAULT_TASKS) for job in state['jobs'].values())
+    if promised + requested > PARENT_PIDS:
+        raise Busy(f'pid_budget: requested={requested}; promised={promised}; parent={PARENT_PIDS}')
 
 
 class GuardError(RuntimeError):
@@ -108,7 +118,9 @@ def enqueue(state, entry):
 def queue_choice(state, capacity, blocked_keys, now):
     queue = [e for e in state.get('queue', []) if e['deadline'] > now]
     # Keys belonging to other environments must not cause global head-of-line blocking.
-    eligible = sorted((e for e in queue if not blocked_keys.intersection(e['keys'])),
+    pid_free = PARENT_PIDS - sum(job.get('tasks', DEFAULT_TASKS) for job in state['jobs'].values())
+    eligible = sorted((e for e in queue if not blocked_keys.intersection(e['keys'])
+                       and e.get('tasks', DEFAULT_TASKS) <= pid_free),
                       key=lambda e: (e['enqueued_at'], e['id']))
     if not eligible:
         return None

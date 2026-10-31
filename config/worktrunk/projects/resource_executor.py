@@ -11,7 +11,7 @@ import sys
 import time
 import uuid
 
-from resource_policy import (GIB, STEP, MAX_JOBS, GuardError, Busy, allocate_memory,
+from resource_policy import (GIB, STEP, MAX_JOBS, DEFAULT_TASKS, admit_tasks, GuardError, Busy, allocate_memory,
     admission, free_capacity, enqueue, queue_choice, estimate_wait, pressure_action,
     jitter_margin, round_up)
 
@@ -55,7 +55,7 @@ def recover_growth(state, backend, registry, base):
             backend.command('set-property', '--runtime', unit, f'MemoryHigh={high}')
             job['memory_high'] = high
             base.verify_caps(backend, unit, actual, True, runtime=job['runtime'],
-                             memory_high=high, policy_version=2)
+                             memory_high=high, policy_version=2, tasks=job.get('tasks', DEFAULT_TASKS))
         job.pop('pending_limit')
         job.pop('pending_high')
         registry.save(state)
@@ -85,7 +85,7 @@ def grow(state, backend, registry, base, unit, target, available, usage, jitter=
         raise GuardError('growth MemoryMax readback failed')
     backend.command('set-property', '--runtime', unit, f'MemoryHigh={job["pending_high"]}')
     base.verify_caps(backend, unit, target, True, runtime=job['runtime'],
-                     memory_high=job['pending_high'], policy_version=2)
+                     memory_high=job['pending_high'], policy_version=2, tasks=job.get('tasks', DEFAULT_TASKS))
     job['limit'], job['memory_high'] = target, job.pop('pending_high')
     job.pop('pending_limit')
     registry.save(state)
@@ -99,13 +99,23 @@ def monitor(registry, backend, base, unit, samples):
         state = registry.load()
         recover_growth(state, backend, registry, base)
         job = state['jobs'][unit]
-        root = base.cgroup_root(backend.info(unit)['ControlGroup'])
-        if not (root / 'memory.current').exists():
+        root = backend.scope_root(unit)
+        if root is None:
             return
+        try:
+            stats = dict(line.split() for line in (root / 'memory.stat').read_text().splitlines())
+            used = backend.memory_usage(unit)
+            if (root / 'pids.peak').exists():
+                job['pids_peak'] = max(job.get('pids_peak', 0), int((root / 'pids.peak').read_text()))
+            if (root / 'pids.events').exists():
+                events = dict(line.split() for line in (root / 'pids.events').read_text().splitlines())
+                job['pids_events'] = int(events.get('max', 0))
+        except FileNotFoundError:
+            if backend.scope_root(unit) is None:
+                return
+            raise
         available = base.mem_available()
         jitter = jitter_margin(samples, now, available)
-        stats = dict(line.split() for line in (root / 'memory.stat').read_text().splitlines())
-        used = backend.memory_usage(unit)
         cache = max(0, int(stats['file'])-int(stats['shmem']))
         job['peak'] = max(job.get('peak', 0), used)
         age = now-job.get('last_reclaim', -1e9)
@@ -137,6 +147,29 @@ def monitor(registry, backend, base, unit, samples):
         registry.save(state)
 
 
+def cleanup_launcher(backend, base, unit, launcher, launcher_start):
+    if backend.populated(unit):
+        backend.stop(unit)
+    deadline = time.monotonic() + 5
+    signalled = False
+    while launcher:
+        finished, _status = os.waitpid(launcher, os.WNOHANG)
+        if finished:
+            break
+        if not signalled and backend.alive(launcher, launcher_start):
+            os.kill(launcher, signal.SIGTERM)
+            signalled = True
+        if time.monotonic() >= deadline:
+            if backend.alive(launcher, launcher_start):
+                os.kill(launcher, signal.SIGKILL)
+            raise GuardError('launcher cleanup deadline; reservation retained: ' + unit)
+        time.sleep(.05)
+    while backend.populated(unit):
+        if time.monotonic() >= deadline:
+            raise GuardError('owned scope still populated; reservation retained: ' + unit)
+        time.sleep(.05)
+
+
 def execute(args, command, options, base):
     registry, backend = base.Registry(), base.Systemd()
     cwd = str(Path.cwd().resolve())
@@ -155,7 +188,8 @@ def execute(args, command, options, base):
             raise GuardError('runtime exceeds goal authority')
     start = time.monotonic()
     expires = start+lease['remaining_seconds'] if lease else float('inf')
-    deadline = min(start+args.wait, expires-(args.runtime if isinstance(args.runtime, int) else 0)-10)
+    windows = getattr(args, 'admission_windows', 1)
+    deadline = min(start + args.wait * windows, expires-(args.runtime if isinstance(args.runtime, int) else 0)-10)
     if deadline < start:
         raise GuardError('goal cannot accommodate runtime and cleanup')
     key = str(Path(args.exclusive_key).resolve(strict=True)) if args.exclusive_key else None
@@ -167,8 +201,9 @@ def execute(args, command, options, base):
     digest = hashlib.sha256((cwd+'\0'+json.dumps(command)).encode()).hexdigest()
     goal = authority['goal_id'] if authority else str(os.getppid())
     signal.signal(signal.SIGTERM, base.interrupt)
-    launcher, reserved, exit_status = None, False, None
+    launcher, launcher_start, reserved, exit_status = None, 0, False, None
     samples, last_print, last_check = [], None, start
+    tasks = args.tasks or DEFAULT_TASKS
     try:
         while True:
             now = time.monotonic()
@@ -187,6 +222,8 @@ def execute(args, command, options, base):
                         raise GuardError('job-id already running; do not submit duplicate work')
                     if any(j.get('policy_version', 1) != 2 for j in state['jobs'].values()):
                         raise Busy('cutover: waiting for legacy scopes to drain without changing their caps')
+                    if any('tasks' not in job for job in state['jobs'].values()):
+                        raise Busy('cutover: waiting for pre-PID-accounting controllers to drain')
                     recover_growth(state, backend, registry, base)
                     available = base.mem_available()
                     jitter = jitter_margin(samples, now, available)
@@ -202,15 +239,17 @@ def execute(args, command, options, base):
                     if required > physical-GIB:
                         raise GuardError('impossible_memory_request: exceeds physical safe capacity')
                     enqueue(state, dict(id=unit, pid=os.getpid(), start=base.pid_identity(os.getpid()),
-                            goal=goal, enqueued_at=start, deadline=max(deadline, now+10), required=required, keys=keys))
+                            goal=goal, enqueued_at=start, deadline=max(deadline, now+10), required=required, keys=keys, tasks=tasks))
                     state['policy_version'] = 2
                     registry.save(state)
                     free = free_capacity(state, available, usage, jitter)
                     occupied = {k for j in state['jobs'].values() for k in j['keys']}
                     chosen = queue_choice(state, free, occupied, now)
                     if chosen != unit:
+                        admit_tasks(state, tasks)
                         eta = estimate_wait(state, unit, free, now)
                         raise Busy('queued: eta=' + ('unknown' if eta is None else str(eta)))
+                    admit_tasks(state, tasks)
                     budget, limit, high = allocate_memory(state, available, args.memory, usage, need=need, jitter=jitter)
                     if authority and limit > authority['resources']['memory_ceiling']:
                         raise GuardError('buffered memory exceeds goal authority; lower --need or use fixed --memory')
@@ -229,11 +268,13 @@ def execute(args, command, options, base):
                         start=base.pid_identity(os.getpid()), launcher_pid=0, launcher_start=0,
                         keys=keys, runtime=args.runtime, policy_version=2, ceiling=ceiling,
                         elastic=args.elastic, started_at=now, workload=digest, goal=goal,
-                        deadline=expires if lease else None, peak=0)
+                        deadline=expires if lease else None, peak=0, tasks=tasks)
                     reserved = True
                     launcher = base.start_launcher(registry, lock_fd, state, unit,
-                        base.scope_command(unit, limit, command, admitted_options, args.runtime, memory_high=high))
-                print(json.dumps(dict(event='admitted', job_id=unit, memory=limit, ceiling=ceiling)), flush=True)
+                        base.scope_command(unit, limit, command, admitted_options, args.runtime,
+                                           memory_high=high, tasks=tasks))
+                    launcher_start = state['jobs'][unit]['launcher_start']
+                print(json.dumps(dict(event='admitted', job_id=unit, memory=limit, ceiling=ceiling, tasks=tasks)), flush=True)
                 break
             except Busy as exc:
                 if time.monotonic() >= deadline:
@@ -270,14 +311,19 @@ def execute(args, command, options, base):
                 pass  # Short admission-lock contention, not a workload retry.
             time.sleep(.5)
         launcher = None
-        return exit_status if exit_status >= 0 else 128-exit_status
+        code = exit_status if exit_status >= 0 else 128-exit_status
+        print(json.dumps(dict(event='completed', job_id=unit, exit=code,
+                              admitted=True, workload_started=None)), flush=True)
+        return code
+    except Busy as exc:
+        if not reserved and launcher is None:
+            print(json.dumps(dict(event='deferred', job_id=unit, phase='admission',
+                                  workload=digest, workload_started=False, admitted=False,
+                                  reason=str(exc), admission_windows=windows)), flush=True)
+        raise
     finally:
         if reserved:
-            if launcher and backend.alive(launcher, base.pid_identity(launcher)):
-                os.kill(launcher, signal.SIGTERM)
-                os.waitpid(launcher, 0)
-            if backend.populated(unit):
-                backend.stop(unit)
+            cleanup_launcher(backend, base, unit, launcher, launcher_start)
         end = time.monotonic()+5
         while True:
             try:
@@ -288,8 +334,10 @@ def execute(args, command, options, base):
                     if reserved and not backend.populated(unit):
                         record = state['jobs'].pop(unit)
                         history = state.setdefault('history', {}).setdefault(digest, [])
-                        history.append(dict(seconds=max(0, time.monotonic()-record['started_at']),
-                                            peak=record.get('peak', 0), exit=exit_status))
+                        measurement = dict(seconds=max(0, time.monotonic()-record['started_at']),
+                                           peak=record.get('peak', 0), exit=exit_status)
+                        measurement.update({key: record[key] for key in ('pids_peak', 'pids_events') if key in record})
+                        history.append(measurement)
                         del history[:-20]
                         # Bounded metadata; no commands, credentials or payloads.
                         while len(state['history']) > 256:
