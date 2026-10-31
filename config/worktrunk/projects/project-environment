@@ -48,7 +48,8 @@ def dependencies_key(root):
     paths += sorted(root.glob('apps/*/package.json')) + sorted(root.glob('lib/*/package.json'))
     node = subprocess.check_output(['node', '--print',
         'JSON.stringify({node:process.version,abi:process.versions.modules,platform:process.platform,arch:process.arch})'], text=True)
-    h = hashlib.sha256(node.encode())
+    npm = subprocess.check_output(['npm', '--version'], text=True).strip()
+    h = hashlib.sha256((node + '\0' + npm).encode())
     for path in paths:
         h.update(str(path.relative_to(root)).encode())
         h.update(path.read_bytes())

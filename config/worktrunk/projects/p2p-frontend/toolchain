@@ -1,0 +1,15 @@
+#!/bin/sh
+# P2P CI uses node:24-bookworm. Reuse the installed Node 24 without changing host PATH.
+set -eu
+bin=/home/q/.local/share/zed/node/node-v24.11.0-linux-x64/bin
+if [ ! -x "$bin/node" ] || [ ! -x "$bin/npm" ]; then
+  echo 'p2p-toolchain: installed Node 24/npm missing; no install or host fallback performed' >&2
+  exit 1
+fi
+PATH="$bin:$PATH"
+export PATH
+case "$(node --version)" in
+  v24.*) ;;
+  *) echo 'p2p-toolchain: expected Node 24; command not started' >&2; exit 1 ;;
+esac
+exec "$@"
