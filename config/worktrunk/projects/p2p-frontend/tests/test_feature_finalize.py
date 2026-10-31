@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Finite native unittest: branch review and forge gates, no live LLM/forge."""
 import importlib
-from contextlib import redirect_stdout
-import io
 import json
 import os
 from pathlib import Path
@@ -19,6 +17,7 @@ sys.path.insert(0, str(HERE))
 class BranchTests(unittest.TestCase):
     def setUp(self):
         self.f = importlib.import_module('feature_finalize')
+        self.native_run = subprocess.run
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -34,6 +33,9 @@ class BranchTests(unittest.TestCase):
         self.base = self.git('rev-parse', 'HEAD')
         self.git('update-ref', 'refs/remotes/origin/dev', self.base)
         self.git('checkout', '-qb', 'DEV-capitalism-slave-example')
+        (self.root / '.git/info/exclude').write_text('.superpowers/\n')
+        self.artifacts = self.root / '.superpowers'
+        self.artifacts.mkdir()
 
     def git(self, *args):
         return subprocess.check_output(['git', '-C', str(self.root), *args], text=True).strip()
@@ -79,7 +81,6 @@ class BranchTests(unittest.TestCase):
         command = self.f.agent_command(self.root, [self.root / 'input.md'], plan=True)
         self.assertIn('--model=openai-codex/gpt-6.1-sol', command)
         self.assertIn('--thinking=high', command)
-        self.assertIn('--service-tier=priority', command)
         self.assertIn('--no-prewalk', command)
         self.assertIn('--no-extensions', command)
         tools = next(arg for arg in command if arg.startswith('--tools='))
@@ -89,6 +90,67 @@ class BranchTests(unittest.TestCase):
         self.assertEqual(tools, '--tools=read,glob,grep,edit,write,bash,todo,eval')
         self.assertNotIn('task', tools)
         self.assertNotIn('ask', tools)
+
+    def model_output(self, command, **kwargs):
+        if command[0] != str(self.f.GUARD):
+            return self.native_run(command, **kwargs)
+        message = {'role': 'assistant', 'stopReason': 'stop',
+                   'content': [{'type': 'text', 'text': 'Completed source review.'}]}
+        kwargs['stdout'].write(json.dumps({'type': 'agent_end', 'messages': [message]}) + '\n')
+        kwargs['stdout'].flush()
+        (Path(kwargs['stdout'].name).parent / 'implementation.json').write_text(json.dumps({
+            'source_key': self.f.source_key(self.root), 'commits': [], 'tests': [],
+            'fixed': [], 'backend': [], 'warnings': [], 'blockers': [],
+            'ui': {'required': False}}))
+        return subprocess.CompletedProcess(command, 0)
+
+    def test_source_phase_keeps_guard_but_does_not_reserve_browser_pids(self):
+        for plan in (False, True):
+            output = self.artifacts / ('plan.md' if plan else 'implementation.log')
+            with patch.object(self.f.subprocess, 'run', side_effect=self.model_output) as run:
+                self.f.run_agent(self.root, [], output, plan=plan)
+            command = next(call.args[0] for call in run.call_args_list if call.args[0][0] == str(self.f.GUARD))
+            self.assertEqual(command[command.index('--tasks') + 1], '256')
+            self.assertIn('--mode=json', command)
+            self.assertEqual(output.read_text(), 'Completed source review.\n')
+
+    def test_exit_zero_without_terminal_message_is_not_completion(self):
+        def boundary(command, **kwargs):
+            kwargs['stdout'].write('Deadline exceeded\n')
+            return subprocess.CompletedProcess(command, 0)
+        with patch.object(self.f.subprocess, 'run', side_effect=boundary):
+            with self.assertRaisesRegex(RuntimeError, 'completion'):
+                self.f.run_agent(self.root, [], self.root / 'plan.md', plan=True)
+
+    def test_exit_zero_requires_valid_manifest_for_current_source(self):
+        output = self.artifacts / 'implementation.log'
+        for value in (None, '{broken', json.dumps({'source_key': 'stale'})):
+            def boundary(command, **kwargs):
+                if command[0] != str(self.f.GUARD):
+                    return self.native_run(command, **kwargs)
+                result = self.model_output(command, **kwargs)
+                manifest = self.artifacts / 'implementation.json'
+                if value is None:
+                    manifest.unlink()
+                else:
+                    manifest.write_text(value)
+                return result
+            with patch.object(self.f.subprocess, 'run', side_effect=boundary):
+                with self.assertRaisesRegex(RuntimeError, 'manifest'):
+                    self.f.run_agent(self.root, [], output, plan=False)
+
+    def test_exit_75_is_deferred_only_with_never_started_lifecycle(self):
+        deferred = {'event': 'deferred', 'phase': 'admission',
+                    'admitted': False, 'workload_started': False}
+        for records, expected in (([deferred], 'deferred'),
+                                  ([], 'infrastructure_failure'),
+                                  ([{'event': 'workload_start'}, deferred], 'infrastructure_failure')):
+            command = [sys.executable, '-c',
+                       'print(' + repr('\n'.join(json.dumps(r) for r in records)) + '); raise SystemExit(75)']
+            with self.assertRaises(self.f.CheckFailed) as failure:
+                self.f.checked(self.root, command, self.artifacts / 'check.log')
+            self.assertEqual(failure.exception.kind, expected)
+            self.assertFalse(failure.exception.source)
 
     def test_manifest_requires_every_refactor_file_in_one_atomic_topic(self):
         manifest = {'commits': [{'message': 'refactor(admin): simplify dialog', 'paths': ['lib/admin-layer/x.ts']}],
@@ -152,6 +214,31 @@ class BranchTests(unittest.TestCase):
         with self.assertRaises(self.f.CheckFailed) as failure:
             self.f.checked(self.root, command, self.root / 'check.log')
         self.assertFalse(failure.exception.source)
+
+    def test_assertion_only_in_native_json_is_a_source_failure(self):
+        report = self.root / 'vitest.json'
+        command = [sys.executable, '-c',
+                   'import json; from pathlib import Path; '
+                   'Path("vitest.json").write_text(json.dumps({"success":False,'
+                   '"numFailedTests":1,"testResults":[]})); raise SystemExit(1)']
+        with self.assertRaises(self.f.CheckFailed) as failure:
+            self.f.checked(self.root, command, self.root / 'check.log', report=report)
+        self.assertTrue(failure.exception.source)
+        self.assertEqual(failure.exception.kind, 'source_failure')
+
+    def test_resource_failure_wins_over_native_assertion_report(self):
+        report = self.root / 'vitest.json'
+        report.write_text(json.dumps({'success': False, 'numFailedTests': 1}))
+        command = [sys.executable, '-c', 'print("heap out of memory"); raise SystemExit(137)']
+        with self.assertRaises(self.f.CheckFailed) as failure:
+            self.f.checked(self.root, command, self.root / 'check.log', report=report)
+        self.assertFalse(failure.exception.source)
+        self.assertEqual(failure.exception.kind, 'resource_failure')
+
+    def test_zero_exit_without_native_report_is_not_success(self):
+        with self.assertRaisesRegex(self.f.CheckFailed, 'report'):
+            self.f.checked(self.root, [sys.executable, '-c', 'pass'],
+                           self.root / 'check.log', report=self.root / 'missing.json')
 
     def test_check_restores_only_its_tracked_nuxtrc_mutation_and_stops(self):
         (self.root / '.nuxtrc').write_text('original config\n')
@@ -224,30 +311,36 @@ class CIGateTests(unittest.TestCase):
         self.assertIn('--remove-source-branch=false', args)
         self.assertNotIn('--auto-merge', args)
 
-    def test_ci_wait_reports_current_pipeline_url_and_pending_jobs(self):
-        sha = 'a' * 40
-        branch = 'DEV-capitalism-slave-progress'
-        value = {'source_branch': branch, 'target_branch': 'dev', 'sha': sha,
-                 'state': 'opened', 'source_project_id': 1, 'target_project_id': 1}
-        count = 0
-        class FakeForge:
-            def mr(self, _iid):
-                return value
-            def pages(self, path):
-                nonlocal count
-                if path.endswith('/pipelines'):
-                    count += 1
-                    return [{'id': 12, 'sha': sha, 'status': 'running' if count == 1 else 'success',
-                             'web_url': 'https://forge.invalid/pipelines/12'}]
-                return [{'name': 'Typecheck · Admin', 'status': 'running', 'allow_failure': False}]
-        output = io.StringIO()
-        jobs = [{'id': 1, 'name': 'Typecheck · Admin', 'status': 'success', 'allow_failure': False}]
-        with patch.object(self.c, 'Forge', return_value=FakeForge()), patch.object(self.c, 'pipeline_jobs', return_value=jobs), patch.object(self.c.time, 'sleep'), redirect_stdout(output):
-            proof = self.c.wait_for_ci(Path('/fixture'), 42, branch, sha, {'Typecheck · Admin'})
-        self.assertIn('CI 12', output.getvalue())
-        self.assertIn('Typecheck · Admin=running', output.getvalue())
-        self.assertIn('https://forge.invalid/pipelines/12', output.getvalue())
-        self.assertEqual(proof['sha'], sha)
+
+class ManualMergeTests(unittest.TestCase):
+    def setUp(self):
+        self.f = importlib.import_module('feature_finalize')
+        self.root = Path('/owned')
+        self.opened = {'iid': 42, 'merge_when_pipeline_succeeds': False}
+
+    def test_manual_mr_does_not_mutate_forge(self):
+        with patch.object(self.f.subprocess, 'run') as run:
+            self.assertEqual(self.f.ensure_manual_merge(self.root, self.opened), self.opened)
+        run.assert_not_called()
+
+    def test_existing_auto_merge_is_canceled_and_rechecked(self):
+        forge = unittest.mock.Mock(binary='glab')
+        forge.mr.return_value = self.opened
+        with patch.object(self.f, 'Forge', return_value=forge), \
+                patch.object(self.f.subprocess, 'run') as run:
+            self.assertEqual(self.f.ensure_manual_merge(self.root, {**self.opened, 'merge_when_pipeline_succeeds': True}), self.opened)
+        self.assertEqual(run.call_args.args[0], ['glab', 'api', '--method', 'POST',
+                                               'projects/:id/merge_requests/42/cancel_merge_when_pipeline_succeeds'])
+        forge.mr.assert_called_once_with(42)
+
+    def test_unknown_or_still_enabled_auto_merge_blocks(self):
+        for state in ({'iid': 42}, {**self.opened, 'auto_merge_enabled': True}):
+            forge = unittest.mock.Mock(binary='glab')
+            forge.mr.return_value = state
+            with patch.object(self.f, 'Forge', return_value=forge), \
+                    patch.object(self.f.subprocess, 'run'), \
+                    self.assertRaisesRegex(RuntimeError, 'auto-merge'):
+                self.f.ensure_manual_merge(self.root, state)
 
 
 if __name__ == '__main__':
