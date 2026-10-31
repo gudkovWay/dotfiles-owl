@@ -1,5 +1,5 @@
 ---
-alwaysApply: true
+alwaysApply: false
 description: "Web UI: Taste before implementation, fixed design direction, Anti Slop during implementation. OMP-specific sequencing and conflict precedence."
 ---
 
@@ -11,7 +11,7 @@ Applies to designing, building, redesigning or restyling websites and web-app sc
 
 Read `skill://design-taste-frontend` before web UI implementation. Installed root: `/home/q/.omp/agent/skills/design-taste-frontend/`; if discovery has not refreshed, read its `SKILL.md` directly. Use Taste's subject inventory, argument, idea and composition process as art-direction tools, not a second independent implementation workflow. For an app screen, use its `references/app-screens.md` route rather than landing-page rules.
 
-Existing explicit owner direction, supplied references, brand constraints and the surrounding design system come first. A bounded component, responsive fix or behavior fix reuses that direction; do not redraw the site or reopen settled choices. `skill://frontend-design` is supplementary craft guidance only, not a competing art director.
+Existing explicit owner direction, supplied references, brand constraints and the surrounding design system come first. A bounded component, responsive fix or behavior fix reuses that direction; do not redraw the site or reopen settled choices. Taste owns direction; Anti Slop filters execution. Do not add a second frontend-design workflow.
 
 Before writing UI code, record the applicable direction: product/audience, primary user action, subject-specific idea, section or screen composition, typography, palette, real imagery, ENERGY/RHYTHM/MOTION, and material assumptions. Include a one-line purpose for the major visual choices. Use the existing local spec, or chat for a bounded change. Proposed choices are not owner-approved merely because the agent wrote them. Follow the task's normal design-approval and autonomy boundaries; once direction is settled, do not restart approval for each choice.
 
