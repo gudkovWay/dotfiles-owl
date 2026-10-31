@@ -1,0 +1,15 @@
+skills:
+  customDirectories:
+    - /home/q/.omp/agent/skill-bundles/superpowers
+    - /home/q/.agents/shared/latent-spaces-brag/skills
+  ignoredSkills:
+    - using-superpowers
+    - brainstorming
+    - writing-plans
+    - executing-plans
+    - subagent-driven-development
+    - requesting-code-review
+    - using-git-worktrees
+    - finishing-a-development-branch
+    - writing-skills
+    - dispatching-parallel-agents
