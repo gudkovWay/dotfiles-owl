@@ -2,13 +2,13 @@
 
 hl.config({
 	render = {
-		-- 2 = only for fullscreen windows tagged as game content.
-		-- Hands the game's buffer straight to the display, bypassing composition.
-		direct_scanout = 2,
+		-- Keep fullscreen in the desktop color mode; HDR/scanout transitions
+		-- blank the MSI output and interrupt its night-mode appearance.
+		cm_auto_hdr = 0,
+		direct_scanout = 0,
 	},
 	cursor = {
-		-- 0 = do NOT disable hardware cursors. Software cursors force a full
-		-- recomposite on every cursor move, which kills direct scanout.
+		-- Keep hardware cursors enabled.
 		no_hardware_cursors = 0,
 	},
 	-- Uncomment for tearing (lowest latency, but gives up VRR smoothness).
