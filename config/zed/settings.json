@@ -16,7 +16,7 @@
 {
   // UI font family (for menus, panels, etc.)
   // https://zed.dev/docs/reference/all-settings#ui-font-family
-  "ui_font_family": "Kode Mono",
+  "ui_font_family": "ComicShannsMono Nerd Font",
 
   // Whether to colorize matching brackets (rainbow brackets)
   // https://zed.dev/docs/reference/all-settings#colorize-brackets
@@ -151,7 +151,8 @@
   // Fallback fonts for editor buffer
   // https://zed.dev/docs/reference/all-settings#buffer-font-fallbacks
   "buffer_font_fallbacks": [
-    "Kode Mono",
+	  "OCR A Std",
+	  // "Kode Mono",
     // "Maple Mono NF",
     // "JetBrainsMono Nerd Font Mono",
     // "Menlo",
@@ -198,8 +199,8 @@
   // https://zed.dev/docs/themes
   "theme": {
     "mode": "dark",
-    "light": "Maple Light",
-    "dark": "Maple Dark",
+    "light": "Nibelung",
+    "dark": "Nibelung Dark",
   },
 
   // UI font size (for menus, panels, etc.)
@@ -208,7 +209,7 @@
 
   // Editor buffer font size
   // https://zed.dev/docs/reference/all-settings#buffer-font-size
-  "buffer_font_size": 18.5,
+  "buffer_font_size": 16.5,
 
   // Finder model width
   // https://zed.dev/docs/reference/all-settings#file-finder
@@ -218,7 +219,8 @@
 
   // Buffer font family (editor font)
   // https://zed.dev/docs/reference/all-settings#buffer-font-family
-  "buffer_font_family": "Kode Mono",
+  // "buffer_font_family": "Kode Mono",
+  "buffer_font_family": "ComicShannsMono Nerd Font",
 
   // Vim mode settings
   // https://zed.dev/docs/reference/all-settings#vim
@@ -658,7 +660,7 @@
   // https://zed.dev/docs/reference/all-settings#inlay-hints
   // Preconfigured for: Go, Rust, TypeScript, Svelte
   "inlay_hints": {
-    "enabled": true,
+    "enabled": false,
   },
 
   // LSP (Language Server Protocol) configuration
@@ -746,8 +748,9 @@
       "program": "/Users/huynhdung/.cargo/bin/codemux",
     },
     "show_count_badge": true,
-    "font_size": 17.0,
-    "font_family": "Kode Mono",
+    "font_size": 15.0,
+    // "font_family": "Kode Mono",
+    "font_family": "ComicShannsMono Nerd Font",
     "env": {
       "EDITOR": "zed --wait",
     },
