@@ -1,4 +1,3 @@
-
 -- Keep every monitor at non-negative coordinates: XWayland cannot represent a
 -- negative layout and repacks the outputs side by side, which makes Wine/UE5
 -- games pick the wrong monitor size. DP-2 stays above DP-3, same as before.
@@ -15,5 +14,19 @@ hl.monitor({
 	scale = "1",
 })
 
--- Bigger outer gaps only on monitor DP-2 (m[...] selector matches that monitor's workspaces)
-hl.workspace_rule({ workspace = "m[DP-2]", gaps_out = 150 })
+-- Левый рельс Noctalia (`bar.mina-left`, thickness = 104) резервирует 104 px
+-- на каждом мониторе, поэтому отступ окна слева = 104 + gaps_out, а справа —
+-- только gaps_out. Чтобы окно не липло к правому краю, правый отступ получает
+-- ту же суммарную ширину, что и левый: gaps_out задан по сторонам (CssGap).
+local LEFT_RAIL = 104
+
+hl.workspace_rule({
+	workspace = "m[DP-3]",
+	gaps_in = 0,
+	gaps_out = { top = 0, right = LEFT_RAIL, bottom = 0, left = 0 },
+})
+hl.workspace_rule({
+	workspace = "m[DP-2]",
+	gaps_in = 0,
+	gaps_out = { top = 0, right = LEFT_RAIL, bottom = 0, left = 0 },
+})

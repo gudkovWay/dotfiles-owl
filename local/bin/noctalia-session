@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Launch the installed Noctalia with the canonical XDG profile.
+set -euo pipefail
+
+if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+	echo "noctalia-session: WAYLAND_DISPLAY is not set" >&2
+	exit 1
+fi
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/noctalia"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/noctalia"
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/noctalia"
+noctalia_bin="/home/q/.local/opt/noctalia/bin/noctalia"
+
+for directory in "$config_dir" "$state_dir" "$data_dir"; do
+	if [[ "$directory" != /* || ! -d "$directory" ]]; then
+		echo "noctalia-session: canonical directory missing or not absolute: $directory" >&2
+		exit 1
+	fi
+done
+if [[ ! -x "$noctalia_bin" ]]; then
+	echo "noctalia-session: installed executable missing: $noctalia_bin" >&2
+	exit 1
+fi
+
+# Only the managed compositor's initial shell launch finalizes UWSM readiness.
+if [[ $# -eq 0 && -n "${NOTIFY_SOCKET:-}" ]]; then
+	uwsm finalize
+fi
+
+# Enable sampled heap diagnostics only for the shell, not standalone CLI calls.
+# Removing this marker restores the normal allocator configuration on next launch.
+heap_profile_marker="/home/q/.local/state/noctalia-leak/heap-profile.enabled"
+if [[ $# -eq 0 && -f "$heap_profile_marker" ]]; then
+	heap_profile_dir="/home/q/dev/qol/.worktrees/noctalia-q-local/DEV-capitalism-slave-uppercase-key-capture/.superpowers/assets/live-heap-profile-20261020/profiles"
+	mkdir -p -- "$heap_profile_dir"
+	chmod 700 -- "$heap_profile_dir"
+	export MALLOC_CONF="${MALLOC_CONF:+${MALLOC_CONF},}prof:true,prof_active:true,lg_prof_sample:20,lg_prof_interval:29,prof_accum:false,prof_final:false,prof_prefix:${heap_profile_dir}/noctalia"
+	export NOCTALIA_IDLE_PROFILE=1
+fi
+
+exec env \
+	-u NOCTALIA_CONFIG_HOME \
+	-u NOCTALIA_STATE_HOME \
+	-u NOCTALIA_DATA_HOME \
+	GLIBC_TUNABLES=glibc.malloc.arena_max=2:glibc.malloc.mmap_threshold=1048576:glibc.malloc.trim_threshold=2097152 \
+	"$noctalia_bin" "$@"

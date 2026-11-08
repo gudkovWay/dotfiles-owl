@@ -21,6 +21,7 @@
 local M = {}
 
 local rules = {}
+local agent_workspace = require("config.agent_workspace")
 
 ---@param spec table { match = { class = string|string[] }, workspace = integer|string }
 function M.window_rule(spec)
@@ -38,11 +39,29 @@ function M.window_rule(spec)
     return spec
 end
 
+-- The layout may focus a new target before window.open is emitted.
+hl.on("window.open_early", function(w)
+    local workspace = agent_workspace.destination(w)
+    if workspace then
+        hl.dispatch(hl.dsp.window.set_prop({ prop = "no_focus", value = "true", window = w }))
+        hl.dispatch(hl.dsp.window.move({ workspace = workspace, follow = false, window = w }))
+        -- mapWindow has another focus path after window.open; restore normal rules next turn.
+        hl.timer(function()
+            if w.mapped then
+                hl.dispatch(hl.dsp.window.set_prop({ prop = "no_focus", value = "unset", window = w }))
+            end
+        end, { timeout = 1, type = "oneshot" })
+    end
+end)
+
 hl.on("window.open", function(w)
+    if agent_workspace.destination(w) then return end
     local workspace = w and w.class and rules[w.class]
     if workspace then
         hl.dispatch(hl.dsp.window.move({ workspace = workspace, follow = false, window = w }))
     end
 end)
+
+_G.omp_agent_workspace_version = 1
 
 return M

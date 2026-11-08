@@ -30,7 +30,7 @@ polkit_agent = true
 settings_show_advanced = true
 
     [shell.greeter_sync]
-    auto_sync = true
+    auto_sync = false
 
     [shell.panel]
     open_near_click_control_center = true
@@ -51,7 +51,10 @@ settings_show_advanced = true
     variant = "default"
 
     [[shell.session.actions]]
-    action = "logout"
+    action = "command"
+    command = "uwsm stop"
+    glyph = "logout"
+    label = "Log out of ShojiWM"
     countdown_seconds = 0.0
     enabled = true
     shortcut = "2"
@@ -78,12 +81,6 @@ settings_show_advanced = true
     shortcut = "5"
     variant = "destructive"
 
-    # Гасит экраны, не блокируя сессию. Будит их только пробел — так устроен
-    # сам скрипт, см. комментарий у него в шапке.
-    # action = "command" — это и есть «свой пункт»: Noctalia запускает command
-    # вместо встроенного действия. Ни "custom", ни "exec"/"script"/"run" эта
-    # сборка (5.0.0_beta.10) не понимает и молча выбрасывает такой пункт из
-    # панели, не ругаясь при этом ни в `config validate`, ни в лог.
     [[shell.session.actions]]
     action = "command"
     command = "/home/q/.config/hypr/scripts/monitors.sh off"
@@ -94,9 +91,6 @@ settings_show_advanced = true
     shortcut = "6"
     variant = "default"
 
-    # Гасит экраны, не блокируя сессию. Будит их только пробел — так устроен
-    # сам скрипт, см. комментарий у него в шапке.
-
 [system.monitor]
 gpu_poll_seconds = 2
 
@@ -106,7 +100,7 @@ source = "wallpaper"
 wallpaper_scheme = "m3-tonal-spot"
 
     [theme.templates]
-    builtin_ids = [ "btop", "gtk3", "gtk4", "kcolorscheme", "kitty", "qt", "alacritty", "hyprland" ]
+    builtin_ids = ["hyprland"]
 
 [widget.clock]
 color = "secondary"
