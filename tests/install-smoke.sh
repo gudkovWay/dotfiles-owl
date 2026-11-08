@@ -119,6 +119,7 @@ for relative in \
   projects/p2p-frontend/push projects/p2p-frontend/stand projects/p2p-frontend/typecheck \
   projects/p2p-frontend/mr projects/p2p-frontend/mr-guard projects/p2p-frontend/mr-command \
   projects/p2p-frontend/feature-finalize projects/p2p-frontend/feature_finalize.py \
+  projects/p2p-frontend/finalize_agent.mjs projects/p2p-frontend/linear_editor.mjs \
   projects/p2p-frontend/merge_readiness.py projects/p2p-frontend/finalize-prompt.md; do
   destination="$FAKE_CONFIG/worktrunk/$relative"
   [[ -L "$destination" && "$(readlink -f "$destination")" == "$REPO/config/worktrunk/$relative" ]] ||

@@ -113,7 +113,9 @@ def session_manager(process):
     # the login session, not a worktree; recognize the pair, not arbitrary names.
     args = process.joinpath('cmdline').read_bytes().rstrip(b'\0').split(b'\0')
     parent = process.joinpath('stat').read_text().rsplit(')', 1)[1].split()[1]
-    if args == [b'/usr/lib/systemd/systemd', b'--user'] and parent == '1':
+    manager_args = args[:2] == [b'/usr/lib/systemd/systemd', b'--user'] and (
+        len(args) == 2 or len(args) == 3 and re.fullmatch(rb'--deserialize=\d+', args[2]) is not None)
+    if manager_args and parent == '1':
         return True
     if args == [b'(sd-pam)']:
         return session_manager(Path('/proc') / parent)
@@ -279,7 +281,7 @@ def merge_feature(mr, args):
         raise ValueError('automatic finalization does not rewrite/squash feature history')
     if not finalizer.current_receipt(root, current):
         return subprocess.call([str(Path(__file__).resolve().parent / 'feature-finalize'),
-                                '--mr', str(mr['iid']),
+                                '--mr', str(mr['iid']), '--merge',
                                 *(['--keep-source-branch'] if '--keep-source-branch' in args else [])], cwd=root)
     require_batch_proof(current['branch'], current['head'])
     ci = wait_for_ci(root, mr['iid'], current['branch'], current['head'],

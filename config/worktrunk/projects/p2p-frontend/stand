@@ -349,14 +349,12 @@ class Stand:
 def publish(root, args):
     subject = Stand(root)
     worktree = subject.worktree
-    if len(args) != 2 or args[0].startswith('-') or args[1] != subject.branch:
-        raise Refused('usage: wt push -- <configured-remote> <current-task-branch>; no force/multiple refspecs')
-    remote, branch = args
+    remote, branch, options = batch.push_args(args, subject.branch)
     worktree.stable()
     worktree.clean()
     batch.git(subject.root, 'remote', 'get-url', '--push', remote)
     if worktree.marker.exists() or worktree.marker.is_symlink():
-        command = [sys.executable, str(HERE / 'batch'), 'push', '--', remote, branch]
+        command = [sys.executable, str(HERE / 'batch'), 'push', '--', *options, remote, branch]
     else:
         # Keep ordinary native hooks; never manufacture or bypass a batch proof.
         for name in ('push.followTags', 'remote.' + remote + '.mirror'):
@@ -368,7 +366,7 @@ def publish(root, args):
                                 text=True, capture_output=True)
         if result.returncode not in (0, 1) or result.stdout.strip() not in {'', 'no', 'false'}:
             raise Refused('recursive submodule publication is outside this flow')
-        command = ['git', 'push', remote, f'refs/heads/{branch}:refs/heads/{branch}']
+        command = ['git', 'push', *options, remote, f'refs/heads/{branch}:refs/heads/{branch}']
         hook = Path(batch.git(subject.root, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks')) / 'pre-push'
         if hook.is_file() and os.access(hook, os.X_OK):
             command = [str(batch.GUARD), '--wait', '60', '--exclusive-key', str(subject.root), '--', *command]

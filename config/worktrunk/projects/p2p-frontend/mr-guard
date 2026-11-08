@@ -52,4 +52,4 @@ $matches
 EOF
 done
 
-echo "mr-guard: OK (base $base)"
+echo "mr-guard: OK (base $base)" >&2

@@ -26,10 +26,10 @@ class FinalizationFlowTests(unittest.TestCase):
         self.git('init', '-q')
         self.git('config', 'user.email', 'test@example.invalid')
         self.git('config', 'user.name', 'Test')
-        (self.root / '.claude/commands').mkdir(parents=True)
-        (self.root / '.claude/commands/refactor.md').write_text('fixture architecture')
+        (self.root / '.agents/rules').mkdir(parents=True)
+        (self.root / '.agents/rules/p2p-code.md').write_text('fixture architecture')
         (self.root / 'a.ts').write_text('base\n')
-        self.git('add', 'a.ts', '.claude/commands/refactor.md')
+        self.git('add', 'a.ts', '.agents/rules/p2p-code.md')
         self.git('commit', '-qm', 'base')
         self.base = self.git('rev-parse', 'HEAD')
         self.git('update-ref', 'refs/remotes/origin/dev', self.base)
@@ -62,20 +62,36 @@ class FinalizationFlowTests(unittest.TestCase):
     def test_hook_mutation_requires_fresh_ui_without_repeating_commit_or_model(self):
         self.run_flow(False, ui=True, hook_change=True)
 
-    def test_never_started_checks_resume_without_repeating_model(self):
+    def test_never_started_checks_resume_without_repeating_model_or_completed_checks(self):
         self.run_flow(False, deferred=True)
 
     def test_source_assertion_gets_one_bounded_correction(self):
         self.run_flow(False, source_failure=True)
 
-    def run_flow(self, merge, owner_changes=False, ui=False, hook_change=False, deferred=False, source_failure=False):
-        trace, remote, state = [], [], {'opened': False, 'merged': False, 'hook_changed': False, 'checks_failed': False}
-        original_run = subprocess.run
+    def test_rebased_published_conflicting_draft_is_reviewed_before_exact_lease_push(self):
+        self.run_flow(False, published=True, rebased=True)
+
+    def run_flow(self, merge, owner_changes=False, ui=False, hook_change=False, deferred=False, source_failure=False, published=False, rebased=False, remote_changes=False):
+        trace, remote, state = [], [], {'opened': published, 'merged': False, 'hook_changed': False, 'checks_failed': False}
+        if published:
+            remote.append(self.git('rev-parse', 'HEAD'))
+        expected_remote = remote[0] if rebased else None
+        if rebased:
+            self.git('checkout', '--detach', '-q', self.base)
+            (self.root / 'base.ts').write_text('dev advanced\n')
+            self.git('add', 'base.ts')
+            self.git('commit', '-qm', 'dev advanced')
+            self.git('update-ref', 'refs/remotes/origin/dev', self.git('rev-parse', 'HEAD'))
+            self.git('checkout', '-q', self.branch)
+            self.git('rebase', 'origin/dev')
+        original_run, native_verify = subprocess.run, f.verify_local
+        check_steps = []
         root = self.root
         branch = self.branch
         def source_mr():
-            return {'iid': 42, 'source_branch': branch, 'target_branch': 'dev', 'sha': self.git('rev-parse', 'HEAD'),
+            return {'iid': 42, 'source_branch': branch, 'target_branch': 'dev', 'sha': remote[0] if remote else self.git('rev-parse', 'HEAD'),
                     'state': 'merged' if state['merged'] else 'opened', 'source_project_id': 1, 'target_project_id': 1,
+                    'draft': published, 'has_conflicts': published and remote[0] != self.git('rev-parse', 'HEAD'),
                     'merge_when_pipeline_succeeds': False, 'web_url': 'https://forge.invalid/mr/42'}
         class FakeForge:
             def __init__(self, _root):
@@ -93,6 +109,7 @@ class FinalizationFlowTests(unittest.TestCase):
                     'commits': [{'message': 'refactor(admin): improve feature', 'paths': ['a.ts']}],
                     'tests': [], 'fixed': ['fixture change'], 'backend': ['fixture handoff'],
                     'warnings': [], 'blockers': [], 'ui': {'required': ui, 'status': 'pending'},
+                    'test_selection': 'Fixture changes have no affected native application tests.',
                     'review': {'context_key': rc.load_context(root)['context_key'], 'coverage': [{
                         'paths': ['a.ts'], 'scenario': 'feature value', 'inspected': [{
                             'path': 'a.ts', 'revision': 'worktree', 'sha256': f.sha256(root / 'a.ts')}],
@@ -104,11 +121,20 @@ class FinalizationFlowTests(unittest.TestCase):
             self.assertEqual((root / 'a.ts').read_text(), expected)
             if 'commit' not in trace:
                 self.assertIsNone(current['tree'])
-            if (deferred or source_failure) and not state['checks_failed']:
+            if deferred:
+                return native_verify(_root, current, manifest, _run)
+            if source_failure and not state['checks_failed']:
                 state['checks_failed'] = True
-                raise f.CheckFailed('fixture native source assertion' if source_failure else 'fixture never started',
-                                    source=source_failure, kind='source_failure' if source_failure else 'deferred')
+                raise f.CheckFailed('fixture native source assertion', source=True)
             return {'source': current, 'checks': [], 'ui': manifest['ui']}
+        def checked(_root, command, log, env=None, report=None):
+            step = 'prepare' if 'project-environment' in command[0] else 'typecheck'
+            check_steps.append(step)
+            if step == 'typecheck' and not state['checks_failed']:
+                state['checks_failed'] = True
+                raise f.CheckFailed('fixture admission refused before workload', kind='deferred')
+            log.write_text('completed ' + step)
+            return {'command': command, 'exit': 0, 'log': str(log), 'sha256': f.sha256(log)}
         def run(command, **kwargs):
             if command[:2] == ['wt', 'commit']:
                 self.assertEqual(trace[-1], 'verify')
@@ -120,6 +146,9 @@ class FinalizationFlowTests(unittest.TestCase):
                 return original_run(['git', 'commit', '-qm', command[-1]], **kwargs)
             if command[:2] == ['wt', 'push']:
                 trace.append('push')
+                if rebased:
+                    self.assertEqual(command, ['wt', 'push', '--',
+                        '--force-with-lease=refs/heads/' + branch + ':' + expected_remote, 'origin', branch])
                 remote[:] = [self.git('rev-parse', 'HEAD')]
                 return subprocess.CompletedProcess(command, 0)
             if command[:3] == ['wt', 'mr', '--']:
@@ -133,16 +162,30 @@ class FinalizationFlowTests(unittest.TestCase):
                     original_run(['git', 'update-ref', 'refs/remotes/origin/dev', self.git('rev-parse', 'HEAD')], cwd=root, check=True)
                 return subprocess.CompletedProcess(command, 0)
             if command[0] == 'git' and 'ls-remote' in command:
-                return subprocess.CompletedProcess(command, 0, stdout=remote[0] + '\trefs/heads/' + branch)
+                return subprocess.CompletedProcess(command, 0, stdout=(remote[0] + '\trefs/heads/' + branch) if remote else '')
+            if command[:3] == ['git', 'fetch', 'origin']:
+                (root / '.git/FETCH_HEAD').write_text(remote[0] + '\n')
+                return subprocess.CompletedProcess(command, 0)
             return original_run(command, **kwargs)
-        def ci(*args):
+        def ci(*args, **kwargs):
+            self.assertEqual(kwargs, {'require_mergeable': merge})
             trace.append('ci')
             if owner_changes:
                 with (root / '.superpowers/owner.jsonl').open('a') as journal:
                     journal.write(json.dumps({'type': 'message', 'message': {
                         'role': 'user', 'content': 'Preserve the established reference; do not replace the ID presentation.'}}) + '\n')
             return {'sha': self.git('rev-parse', 'HEAD')}
-        with patch.object(f, 'owned_root', return_value=root), patch.object(f, 'refresh'), patch.object(f, 'ci_requirements', return_value=set()), patch.object(f, 'Forge', FakeForge), patch.object(f, 'run_agent', side_effect=agent), patch.object(f, 'verify_local', side_effect=verify), patch.object(f, 'wait_for_ci', side_effect=ci), patch.object(f.subprocess, 'run', side_effect=run):
+        def tip(*args):
+            if remote_changes and 'verify' in trace:
+                return 'f' * 40
+            return remote[0] if remote else None
+        with patch.object(f, 'owned_root', return_value=root), patch.object(f, 'refresh'), patch.object(f, 'ci_requirements', return_value={'Typecheck · Admin'} if deferred else set()), patch.object(f, 'Forge', FakeForge), patch.object(f, 'run_agent', side_effect=agent), patch.object(f, 'verify_local', side_effect=verify), patch.object(f, 'checked', side_effect=checked), patch.object(f, 'wait_for_ci', side_effect=ci), patch.object(f, 'remote_tip', side_effect=tip), patch.object(f.subprocess, 'run', side_effect=run):
+            if remote_changes:
+                with self.assertRaisesRegex(RuntimeError, 'remote tip changed during review'):
+                    f.finish(root, expected_remote_sha=expected_remote)
+                self.assertNotIn('push', trace)
+                self.assertFalse((root / '.superpowers/finalize/delivery.json').exists())
+                return
             if owner_changes:
                 with self.assertRaisesRegex(RuntimeError, 'owner context changed'):
                     f.finish(root)
@@ -152,33 +195,27 @@ class FinalizationFlowTests(unittest.TestCase):
                 return
             if ui:
                 self.assertEqual(f.finish(root), 0)
-                self.assertEqual(trace, ['plan', 'refactor'])
+                self.assertEqual(trace, ['plan', 'refactor', 'verify', 'commit'] + (['verify'] if hook_change else []))
                 self.assertFalse((root / '.superpowers/finalize/receipt.json').exists())
                 run_dir = next((root / '.superpowers/finalize').glob('*-????????????'))
                 proof_path = run_dir / 'ui-proof.json'
+                screenshot = root / '.superpowers/owned-fixture.png'
+                screenshot.write_bytes(b'\x89PNG\r\n\x1a\n' + b'\0' * 8 + b'\0\0\0\x01' * 2)
+                refreshed = json.loads((run_dir / 'implementation.json').read_text())['review']
+                refreshed['coverage'][0]['inspected'][0]['sha256'] = f.sha256(root / 'a.ts')
                 proof_path.write_text(json.dumps({'ui': {'required': True, 'status': 'verified',
-                    'source_key': f.source_key(root), 'scenarios': ['owned fixture interaction'],
-                    'screenshots': ['owned-fixture.png']}}))
+                    'runtime_key': f.runtime_key(root), 'scenarios': ['owned fixture interaction'],
+                    'screenshots': [str(screenshot)]}, 'review': refreshed}))
                 self.assertEqual(f.finish(root, resume=run_dir, ui_proof=proof_path), 0)
-                if hook_change:
-                    checkpoint = json.loads((run_dir / 'state.json').read_text())
-                    self.assertTrue(checkpoint['post_commit'])
-                    self.assertEqual(checkpoint['phase'], 'awaiting_ui')
-                    self.assertFalse((root / '.superpowers/finalize/receipt.json').exists())
-                    refreshed = json.loads((run_dir / 'implementation.json').read_text())['review']
-                    refreshed['coverage'][0]['inspected'][0]['sha256'] = f.sha256(root / 'a.ts')
-                    proof_path.write_text(json.dumps({'ui': {'required': True, 'status': 'verified',
-                        'source_key': f.source_key(root), 'scenarios': ['fresh interaction after hook'],
-                        'screenshots': ['fresh-owned-fixture.png']}, 'review': refreshed}))
-                    self.assertEqual(f.finish(root, resume=run_dir, ui_proof=proof_path), 0)
             elif deferred:
                 self.assertEqual(f.finish(root), 0)
                 self.assertEqual(trace, ['plan', 'refactor', 'verify'])
                 run_dir = next((root / '.superpowers/finalize').glob('*-????????????'))
                 self.assertEqual(json.loads((run_dir / 'state.json').read_text())['phase'], 'awaiting_checks')
                 self.assertEqual(f.finish(root, resume=run_dir), 0)
+                self.assertEqual(check_steps, ['prepare', 'typecheck', 'typecheck'])
             else:
-                self.assertEqual(f.finish(root, merge=True) if merge else f.finish(root), 0)
+                self.assertEqual(f.finish(root, merge=merge, expected_remote_sha=expected_remote), 0)
         expected = ['plan', 'refactor']
         if source_failure:
             expected += ['verify', 'refactor']
@@ -187,7 +224,7 @@ class FinalizationFlowTests(unittest.TestCase):
         expected += ['verify', 'commit']
         if hook_change:
             expected += ['verify']
-        expected += ['push', 'create', 'ci'] + (['merge'] if merge else [])
+        expected += ['push'] + ([] if published else ['create']) + ['ci'] + (['merge'] if merge else [])
         self.assertEqual(trace, expected)
         self.assertEqual(self.git('log', '-1', '--format=%s'), 'refactor(admin): improve feature')
         self.assertEqual(self.git('status', '--porcelain'), '')
@@ -203,17 +240,33 @@ class FinalizationFlowTests(unittest.TestCase):
         self.assertNotIn('Pending:', human)
 
     def test_failed_sol_phase_does_not_retry_push_or_create_receipt(self):
-        with patch.object(f, 'owned_root', return_value=self.root), patch.object(f, 'refresh'), patch.object(f, 'find_mr', return_value=None), patch.object(f, 'run_agent', side_effect=RuntimeError('resource timeout; no retry')) as agent:
+        with patch.object(f, 'owned_root', return_value=self.root), patch.object(f, 'refresh'), patch.object(f, 'find_mr', return_value=None), patch.object(f, 'remote_tip', return_value=None), patch.object(f, 'run_agent', side_effect=RuntimeError('resource timeout; no retry')) as agent:
             with self.assertRaisesRegex(RuntimeError, 'timeout'):
                 f.finish(self.root)
         self.assertEqual(agent.call_count, 1)
         self.assertFalse((self.root / '.superpowers/finalize/receipt.json').exists())
         self.assertEqual(self.git('status', '--porcelain'), '')
 
+    def test_remote_movement_during_review_blocks_publication(self):
+        self.run_flow(False, published=True, rebased=True, remote_changes=True)
+
+    def test_resume_preserves_exact_lease_and_rejects_omission_or_replacement(self):
+        run = self.root / '.superpowers/finalize/run'
+        run.mkdir(parents=True)
+        for name in ('source.json', 'feature.diff', 'code-rules.md', 'review-context.json', 'plan.md', 'implementation.json'):
+            (run / name).write_text('{}')
+        expected = 'a' * 40
+        f.await_ui(self.root, run, 'policy', 0, expected_remote_sha=expected)
+        current = f.snapshot(self.root, allow_dirty=True)
+        self.assertEqual(f.load_resume(self.root, run.parent, run, current, 'policy', expected)[0], run)
+        for replacement in (None, 'b' * 40):
+            with self.assertRaisesRegex(RuntimeError, 'drift'):
+                f.load_resume(self.root, run.parent, run, current, 'policy', replacement)
+
     def test_resume_rejects_source_policy_artifact_and_failed_state_drift(self):
         run = self.root / '.superpowers/finalize/run'
         run.mkdir(parents=True)
-        for name in ('source.json', 'feature.diff', 'refactor.md', 'review-context.json', 'plan.md', 'implementation.json'):
+        for name in ('source.json', 'feature.diff', 'code-rules.md', 'review-context.json', 'plan.md', 'implementation.json'):
             (run / name).write_text('{}')
         f.await_ui(self.root, run, 'policy', 0)
         current = f.snapshot(self.root, allow_dirty=True)

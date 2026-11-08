@@ -48,6 +48,9 @@ export WT_MR_BASE=dev
 
 # 1. Clean branch passes.
 expect_ok "clean branch"
+sh "$scripts/mr-guard" >"$tmp/stdout" 2>"$tmp/stderr"
+test ! -s "$tmp/stdout" || { echo "FAIL: guard contaminates machine stdout"; exit 1; }
+grep -q 'mr-guard: OK' "$tmp/stderr" || { echo "FAIL: missing guard diagnostic"; exit 1; }
 
 # 2. Unrelated nuxt config change passes.
 printf '\n// tweak: something unrelated\n' >>apps/payscrow-admin/nuxt.config.ts

@@ -4,11 +4,10 @@ import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
-import importlib.machinery
-import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -108,6 +107,23 @@ def protected(branch):
     return branch in {'', 'main', 'master', 'dev'} or branch.startswith(('release', 'refs/'))
 
 
+def push_args(args, current_branch):
+    options = []
+    if len(args) == 3:
+        option, *args = args
+        prefix = '--force-with-lease=refs/heads/' + current_branch + ':'
+        expected = option.removeprefix(prefix)
+        if (not option.startswith(prefix)
+                or not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', expected)
+                or not expected.strip('0')):
+            raise Refused('rewrite requires an exact current-task ref and full nonzero old SHA')
+        options.append(option)
+    if (protected(current_branch) or len(args) != 2 or args[0].startswith('-')
+            or args[1] != current_branch):
+        raise Refused('usage: wt push -- [--force-with-lease=refs/heads/<task>:<old-sha>] <configured-remote> <current-task-branch>')
+    return args[0], args[1], options
+
+
 def registry_path(common, branch):
     return common / 'wt-batches' / (hashlib.sha256(branch.encode()).hexdigest() + '.json')
 
@@ -163,6 +179,7 @@ class Batch:
         self.directory = self.root / '.superpowers/batch'
         self.state_path = self.directory / 'state.json'
         self.marker = registry_path(self.common, self.branch)
+        self._locked = False
         for part in (self.root / '.superpowers', self.directory, self.state_path):
             if part.is_symlink():
                 raise Refused(f'batch state must not be a symlink: {part}')
@@ -180,9 +197,11 @@ class Batch:
                 fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise Refused('this worktree already has an active batch command') from exc
+            self._locked = True
             try:
                 yield
             finally:
+                self._locked = False
                 fcntl.flock(file, fcntl.LOCK_UN)
 
     def clean(self):
@@ -257,7 +276,7 @@ class Batch:
         files = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path, _ in callbacks.values()}
         return callbacks, digest({'files': files, 'tasks': tasks, 'portable_husky': portable})
 
-    def load(self):
+    def load(self, require_marker=True):
         state = read_json(self.state_path)
         required = {'schema', 'root', 'gitdir', 'branch', 'start', 'base', 'base_sha', 'merge_base', 'contract', 'active', 'receipt'}
         if not isinstance(state, dict) or set(state) != required or type(state['schema']) is not int or state['schema'] != SCHEMA:
@@ -272,9 +291,10 @@ class Batch:
             raise Refused('invalid batch receipt')
         if (state['root'], state['gitdir'], state['branch']) != (str(self.root), str(self.gitdir), self.branch):
             raise Refused('batch proof belongs to another worktree/branch')
-        marker = read_json(self.marker)
-        if marker != {'schema': SCHEMA, 'branch': self.branch, 'root': str(self.root)}:
-            raise Refused('batch registration mismatch')
+        if require_marker or self.marker.exists():
+            marker = read_json(self.marker)
+            if marker != {'schema': SCHEMA, 'branch': self.branch, 'root': str(self.root)}:
+                raise Refused('batch registration mismatch')
         return state
 
     def save(self, state):
@@ -292,20 +312,18 @@ class Batch:
         return hooks
 
     def begin(self, base, refresh=False):
+        if not self._locked:
+            raise Refused('batch begin requires the exclusive worktree command lease')
         self.stable()
-        loader = importlib.machinery.SourceFileLoader('wt_batch_owner', str(HERE / 'mr-command'))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        owner = importlib.util.module_from_spec(spec)
-        loader.exec_module(owner)
-        try:
-            owner.ensure_idle(self.root)
-        except owner.Deferred as exc:
-            raise Refused(str(exc)) from exc
         self.clean()
-        old = self.load() if self.state_path.exists() else None
-        if self.marker.exists() and old is None:
-            raise Refused('registered batch state is missing; recover it, do not bypass its gate')
-        if refresh and old is None:
+        old = self.load(require_marker=not refresh) if self.state_path.exists() else None
+        registered = self.marker.exists()
+        if registered:
+            if read_json(self.marker) != {'schema': SCHEMA, 'branch': self.branch, 'root': str(self.root)}:
+                raise Refused('batch registration mismatch')
+            if old is None and not refresh:
+                raise Refused('registered batch state is missing; use explicit --refresh to recover and verify')
+        if refresh and old is None and not registered:
             raise Refused('no existing batch to refresh')
         if old and old['active'] and not refresh:
             raise Refused('batch already active; use status, or explicit --refresh after synchronization')
@@ -318,10 +336,11 @@ class Batch:
                  'branch': self.branch, 'start': self.head(), 'base': base,
                  'base_sha': base_sha, 'merge_base': merge_base, 'contract': contract,
                  'active': True, 'receipt': None}
-        # A Git-local registration preserves the fail-closed gate if ignored
-        # worktree state is accidentally removed. It is not shared Git config.
-        atomic_json(self.marker, {'schema': SCHEMA, 'branch': self.branch, 'root': str(self.root)})
+        # The per-worktree flock owns mutation, not a cleanup scan of all UID
+        # processes. An interrupted pair is recoverable only by --refresh,
+        # which creates a new state without carrying any verification receipt.
         self.save(state)
+        atomic_json(self.marker, {'schema': SCHEMA, 'branch': self.branch, 'root': str(self.root)})
         print(f'wt-batch: active on {self.branch}; pinned base {base_sha}')
 
     def commit(self, args):
@@ -430,9 +449,7 @@ class Batch:
         return receipt['head']
 
     def push(self, args):
-        if len(args) != 2 or args[0].startswith('-') or args[1] != self.branch:
-            raise Refused('usage: wt push -- <configured-remote> <current-task-branch>; no force/multiple refspecs')
-        remote, branch = args
+        remote, branch, options = push_args(args, self.branch)
         git(self.root, 'remote', 'get-url', '--push', remote)
         for name in ('push.followTags', 'remote.' + remote + '.mirror'):
             value = subprocess.run(['git', '-C', str(self.root), 'config', '--bool', '--get', name], text=True, stdout=subprocess.PIPE)
@@ -442,7 +459,7 @@ class Batch:
         if recurse.returncode not in (0, 1) or recurse.stdout.strip() not in ('', 'no', 'false'):
             raise Refused('recursive submodule pushes are outside this batch gate')
         self.check()
-        command = ['git', 'push', remote, f'refs/heads/{branch}:refs/heads/{branch}']
+        command = ['git', 'push', *options, remote, f'refs/heads/{branch}:refs/heads/{branch}']
         if 'pre-push' in self.hook_contract()[0]:
             command = [str(GUARD), '--need', '3G', '--wait', '60', '--exclusive-key', str(self.root), '--', *command]
         result = subprocess.call(command, cwd=self.root)

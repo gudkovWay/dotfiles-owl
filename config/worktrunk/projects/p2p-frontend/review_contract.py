@@ -8,6 +8,13 @@ import subprocess
 
 MAX_CONTEXT = 120_000
 SECRET = re.compile(r'(?i)(?:password|пароль|access[_-]?token|api[_-]?key)\s*[:=]\s*\S+|-----BEGIN .*PRIVATE KEY-----|\bBearer\s+\S+')
+OPERATIONAL_REQUEST = re.compile(
+    r'(?:останови превью|закрой превью|запусти превью|финализируй|создай mr|не мержи|'
+    r'stop preview|start preview|finalize|create mr|do not merge)[.!]?', re.I)
+
+
+def review_identity(context):
+    return {key: context[key] for key in ('schema', 'authority', 'sources', 'requirements')}
 
 
 def digest(value):
@@ -21,11 +28,11 @@ def text_content(content):
 
 
 def capture_context(sessions):
-    requirements, sources = [], []
+    requirements, operations, sources = [], [], []
     for filename in sessions:
         path = Path(filename).resolve(strict=True)
         users, cards, header = [], [], {}
-        for line_number, raw in enumerate(path.read_text().splitlines(), 1):
+        for line_number, raw in enumerate(path.read_text().split('\n'), 1):
             try:
                 entry = json.loads(raw)
             except json.JSONDecodeError:
@@ -48,24 +55,27 @@ def capture_context(sessions):
                 continue
             if SECRET.search(text):
                 raise RuntimeError('likely secret in owner request; create a bounded redacted context explicitly before model review')
-            requirements.append({'id': 'r' + str(len(requirements) + 1), 'text': text,
-                                 'source': {'path': str(path), 'line': number,
-                                            'line_sha256': hashlib.sha256(raw.encode()).hexdigest()}})
+            target = operations if OPERATIONAL_REQUEST.fullmatch(text) else requirements
+            target.append({'id': ('o' if target is operations else 'r') + str(len(target) + 1), 'text': text,
+                           'source': {'path': str(path), 'line': number,
+                                      'line_sha256': hashlib.sha256(raw.encode()).hexdigest()}})
     if not requirements:
         raise RuntimeError('original owner requests are missing from review context')
-    body = {'schema': 1, 'authority': False, 'sources': sources, 'requirements': requirements}
+    body = {'schema': 1, 'authority': False, 'sources': sources,
+            'requirements': requirements, 'operations': operations}
     if len(json.dumps(body, ensure_ascii=False).encode()) > MAX_CONTEXT:
         raise RuntimeError('owner review context exceeds bounded input; do not silently truncate')
-    return {**body, 'context_key': digest(body)}
+    return {**body, 'context_key': digest(review_identity(body))}
 
 
 def validate_context(context):
     if not isinstance(context, dict) or context.get('authority') is not False or context.get('schema') != 1:
         raise RuntimeError('invalid owner review context')
     current = capture_context([source['path'] for source in context['sources']])
-    if current != context:
+    identity = review_identity(context)
+    if context.get('context_key') != digest(identity) or review_identity(current) != identity:
         raise RuntimeError('originating owner context changed; recapture and review the new requirements')
-    return context
+    return current
 
 
 def validate_reference(root, reference):
@@ -149,7 +159,8 @@ def store_context(root, sessions):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.is_symlink():
         raise RuntimeError('review context artifact must not be a symlink')
-    path.write_text(json.dumps(context, ensure_ascii=False, indent=2) + '\n')
+    stored = {**review_identity(context), 'context_key': context['context_key']}
+    path.write_text(json.dumps(stored, ensure_ascii=False, indent=2) + '\n')
     path.chmod(0o600)
     return context
 
