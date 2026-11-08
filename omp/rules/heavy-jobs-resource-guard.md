@@ -69,6 +69,20 @@ Goal job имеет устойчивый job_id, submit/status/wait/cancel, пр
 
 Fairness — между goal, с aging крупных запросов. Все необходимые locks получать согласованно; ожидание своего lock — dependency error для перепланирования. Принципиально невозможный запрос не держать в вечной очереди. GPU/VRAM отдельно от RAM: game/GPU lease не запрещает CPU-only typecheck.
 
-Обычный runtime 600s. `--approved-double` только для явно согласованной повторной попытки удваивает fixed memory и runtime; no-timeout только для прямо запрошенной конкретной сборки. Флаг не доказывает approval. Long wait/runtime требуют broker ticket, соответствующего cwd, parent PID/start, scope и expiry; текст/brief/JSON без проверки broker не авторизуют.
+Обычный runtime600s сохраняется для tests/build/typecheck. Управляемые agent/review
+процессы и явно запрошенный ручной localhost используют `--runtime 0`: это
+infinity без снятия RAM/PID/CPU caps, accounting, environment/port ownership и cleanup.
+Они работают до completion, явного stop/cancellation или crash; отсутствие stdout
+не является причиной остановки. Не ставить поверх них SDK total deadline,
+process-age watchdog или внешний bash timeout; managed service — через name,
+конечный agent job — async с timeout0. Ограниченные startup/readiness, отдельные
+network/tool operations и teardown остаются; они не должны убивать весь review.
+Goal runtime/grant expiry не обходить: infinity не расширяет broker envelope.
+Долгое ожидание/конечный runtime сверх600s по-прежнему требует goal ticket.
+`--approved-double` и сборочный `--approved-no-timeout` не заменяют полномочия.
 
-Внешний deadline обязан покрыть admission+runtime+cleanup: не менее 700s для одного окна 60s/runtime600, не менее 800s для двух окон. UI/game/browser только в разрешённой owned поверхности, не на личном desktop по умолчанию. Неупражнённый runtime — unverified. OOM/resource kill/timeout/infra failure прекращают попытку; допустимая конечная retry ladder должна быть согласована заранее в goal, а не выдумана после сбоя.
+Для конечного runtime внешний deadline покрывает admission+runtime+cleanup:
+не менее700s для60/600 и800s для двух окон. OOM/resource kill/timeout/infra failure
+не дают автоматического повтора; новая политика lifetime не превращает старую
+неудачную попытку в never-started. Owned UI/game/browser — только на разрешённой
+поверхности. Непроверенные этапы остаются unverified.

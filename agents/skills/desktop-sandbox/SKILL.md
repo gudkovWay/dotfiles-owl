@@ -1,6 +1,6 @@
 ---
 name: desktop-sandbox
-description: Используй при изменении desktop-инструмента, GUI-проверке, exposed=0, screen off, устаревшем capture, вложенном Hyprland, второй noctalia или аудите изоляции. Выбирай отдельный экземпляр и диагностируй переход на виртуальный output; read-only аудит не разрешает запуск.
+description: Используй при изменении desktop-инструмента, GUI-проверке, exposed=0, screen off, HEADLESS-1 0×0/GBM bo null, устаревшем capture, вложенном Hyprland, второй noctalia или аудите изоляции. Выбирай отдельный экземпляр и диагностируй переход на виртуальный output; read-only аудит не разрешает запуск.
 ---
 
 # Desktop-проверка отдельного экземпляра
@@ -115,8 +115,8 @@ verified/unverified/blocked либо неприменимость с причи�
 действие, кадр — взаимодействие, установка — активацию.
 
 ## Failure modes
-
 - `exposed=0`, DPMS off, hidden stall, старый буфер, HEADLESS-1 0×0 или отсутствие screencopy → **display fallback**: выполни `references/display-fallback.md`, не показывай host и не останавливай всю задачу.
+- `HEADLESS-1 0×0` + GBM/modifier/`bo null`, а также preflight nested-стенда → сначала [известный фикс Aquamarine](/home/q/storage/projects/workflow/README.md#aquamarine-headless-gbm-recovery): версии/ABI, проверенная библиотека и патч, scoped загрузка, native evidence. Не выдавай повтор этого дефекта за окончательный блокер до диагностики.
 - `supplied geometry did not intersect` → проверь output/координаты по display fallback; причина не доказана одним сообщением.
 - Смена display-среды требует сохранения native runner, критериев и caps; отдельный crash/OOM не списывай на screen off.
 - Снимок live desktop → не просматривай/не публикуй, останови owned capture.
@@ -136,15 +136,15 @@ verified/unverified/blocked либо неприменимость с причи�
 
 | Дата | Состояние |
 |---|---|
+| 2026-11-01 | Повторный GBM/headless-сбой исправлен сохранённым патчем Aquamarine0.15.1; owned QHD render/driving прошли. Процедура и evidence — по ссылке выше; это не отменяет отдельную несовместимость Gamescope ниже. |
 | 2026-10-26 | Headless Gamescope стартует без live display, но установленный Hyprland/Aquamarine требует wl_compositor v6 при server max v5 и падает до кадра. `--headless` runtime blocked; свежий render/driving не доказаны. |
 | 2026-10-02 | Исторический аудит: hidden capture failed, wrapper runtime unverified; запрет прогонов относился к тому аудиту, не всем будущим задачам. Zen source profile сохранён, причина нового HOME-profile неизвестна. |
 
 Подробные quotes/исходы: `references/isolation-render-evidence.md`, читать при диагностике.
 
 ## Session mistakes
-
+- 2026-11-01: исправленный Aquamarine остался в старом worktree; новый стенд загрузил системный DSO и агент преждевременно остановился. До запуска/вывода о GBM-блокере проверять известный фикс; восстановление стенда не завершает исходную задачу.
 - 2026-10-25: разрешение автономного запуска не заменяет рабочую маршрутизацию; uwsm может вывести процесс из resource scope. Bus-policy нужна каждому GUI/daemon сценарию.
 - 2026-10-02/09-30: socket/`ok` приняли за capture; hidden stall/GBM failures не доказали неподдерживаемый mode.
 - 2026-09-18–21: XDG/state-only не защитили live конфиги/LED/mpv; проверять HOME, bus, paths и process ownership.
-
 Self-check: при недоступной поверхности выполнена диагностика display fallback; отдельный экземпляр/bus/IPC, capture/interaction/preservation и teardown доказаны либо названы точные блокеры; независимая работа продолжается.

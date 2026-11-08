@@ -33,6 +33,21 @@ Superpowers не меняют полномочия и порядок Worktrunk. 
    не подразумевает rewrite/force-push. Отдельные темы = отдельные коммиты,
    но не обязательно отдельные worktree.
 
+### p2p: Linear companion
+
+После создания или reuse owned task-worktree p2p выполнить
+`python3 /home/q/.config/worktrunk/projects/p2p-frontend/linear_workflow.py ensure --root <path-из-Worktrunk>`,
+затем прочитать `<owned-worktree>/.omp/skills/p2p-linear/SKILL.md`, даже если
+скилл ещё не появился в discovery текущей сессии. Pre-start устанавливает
+только локальный скилл; вопросов, моделей и записей в Linear в hook нет.
+Для принятой реализации companion ведёт одну связанную задачу через уже
+подключённый OMP MCP: Luna low готовит краткие чекбоксы параллельно, main
+сверяет и публикует. Вопросы/read-only и обычный switch карточки не создают.
+На продолжении проверить сохранённый issue/MR; `Deployment` только после
+готовности и подтверждённого dev merge. Полный контракт находится только
+в project-local companion; ecom этим не включается.
+
+
 ## 2. Разрешение ветки и базы (контракт, порядок точный)
 
 Сначала различи продолжение работы в целевой ветке и новую самостоятельную задачу.
@@ -185,6 +200,13 @@ shared writable outputs, resource retries или вопросов на кажд�
 Для минимальных DEV test-account grants — процедура `p2p DEV permissions`
 в `skill://repository-testing`, не глобальное редактирование пермишена.
 
+Ручной localhost по явному запросу — `wt dev` как named managed service до stop,
+без total-runtime timeout (default seconds0). Явный `--seconds=30..540` сохраняет
+конечный режим. Readiness60s — только запуск, не срок ручного тестирования.
+Сохранять root/app/URL/PID/handle; закрывать только свой сервис с teardown и
+освобождением lease/reservation, не чужой процесс по порту. `wt ui` остаётся
+отдельной конечной автоматической проверкой. RAM/PID/CPU caps обязательны.
+
 ## 6b. p2p commit: обычный режим и явная партия
 
 Коммиты и доставка требуют отдельной авторизации. Разные темы — разные
@@ -292,7 +314,7 @@ p2p-исполнитель; вне p2p использовать native PR/MR wor
 `rule://delegation-pipeline`; не спрашивать повторно о запуске. Sol
 `openai-codex/gpt-6.1-sol`, thinking `high`, native `priority` (`/fast`), без
 fallback: сначала read-only план полного cumulative diff от merge-base с
-актуальным origin/dev, затем frontend refactor с worktree `.claude/commands/refactor.md`.
+актуальным origin/dev, затем frontend refactor с worktree `.agents/rules/p2p-code.md`.
 Промпт Senior Frontend Engineer, реальные границы сложности/реактивности/API,
 не «любой вложенный цикл плох». Backend-пункты идут в отдельный handoff,
 не маскируются фронтовым workaround. Модель не делает Git delivery:
@@ -309,18 +331,47 @@ Main передаёт исходный owner-запрос и последующ�
 Context нужен и при skip-sol; явный отказ отключает модель, не owner acceptance.
 Сопоставление diff/аналога содержит проверенные paths/revisions/hashes и
 решение preserve-reference/adopt-new-flow/keep-local с исходными основаниями.
-Возраст сам по себе не определяет победителя. Неявное прежнее согласование
-не выдумывать: неизвестность отмечать, устоявшийся референс сохранять.
-Новый flow может вытеснить legacy-аналог по конкретному требованию, но не
-разрешает глобальную миграцию, не нужную для текущего scope.
+Возраст сам по себе не определяет победителя. Явный запрос и последующие поправки
+владельца выше исторических паттернов, карты компонентов и плана агента.
+Карта помогает найти код, а не назначает постоянный дизайн-эталон. До правок
+назвать целевую поверхность и направление; не откатывать выбранный новый вид
+под legacy-аналог и не расширять локальную правку до глобальной миграции.
 
-Receipt связан с HEAD/tree, origin/dev/merge-base, исходными runtime bytes,
+Receipt связан с HEAD/tree, origin/dev/merge-base, полными source bytes,
 политикой/общим review-контрактом, owner-context и verification report.
-Новая owner-поправка, hooks, commit или база могут инвалидировать evidence.
-Required tests — конечные выбранные native files, form в обоих skins;
-complete app typechecks — по текущему CI. Изменённый UI требует настоящего
-owned runtime, nonzero кадра и сценариев для этих source bytes, а не ещё
-одного статического review.
+Изменившиеся inputs инвалидируют соответствующие этапы, а не автоматически
+весь процесс. Local tests — finite files по поведению и существующему покрытию,
+не по серверной CI-матрице; при пустом наборе нужен конкретный test_selection reason.
+Complete affected app typechecks и exact-SHA серверный CI сохраняются.
+UI proof использует runtime_key; source/review/checks/delivery — полную identity.
+
+### Порядок одного прохода (обязателен)
+
+В исследованной длинной сессии наблюдались повторные Sol/check/UI-раунды.
+В журнале main указан cost около $17.5; это не полный биллинг всех дочерних
+сессий. Порядок ниже предотвращает повторение работы:
+
+1. **Source замораживается до review.** Все известные правки, включая
+   собственные наблюдения main, применяются до вызова `wt finalize`. Один
+   `wt finalize` на финальный SHA; новые коммиты после receipt — только при
+   смене требований или подтверждённой ошибке source, и тогда это осознанный
+   новый проход, а не привычка.
+2. **Проверки — по impact.** Manifest выбирает конечные behavioral files,
+   не тест на каждый touched file/CI job. Не добавлять class snapshots,
+   source-text wiring assertions или дубликаты покрытой матрицы.
+   Полные затронутые typecheck-проекты обязательны; серверный CI независим.
+   Один writer checks на environment.
+3. **UI — после checks и hooks.** Контроллер выполняет native checks, атомарные
+   commits/hooks, при изменении source — затронутые checks, затем awaiting_ui.
+   На resume неизменных source/policy/context reuse проверенные code-proof logs,
+   не повторный plan/refactor/checks. runtime_key исключает только известные native
+   test-source paths; production/config/deps/env остаются входами UI.
+4. **Состояние после компакции берётся из прогона, а не из канона.** Источник
+   истины — `.superpowers/finalize/<run>/state.json`, `receipt.json`,
+   `delivery.json` и `.superpowers/research/*`. После компакции перечитывается
+   конкретный раздел правила/скилла по range, а не файл целиком: полный
+   `SKILL.md` (55 КБ) и тела правил (24–28 КБ каждое), перечитанные на каждом
+   раунде, — основной вклад в раздутый контекст и повторные ходы.
 
 Sol-этап ограничен source: terminal `agent_end` с stopReason=stop и полный
 `implementation.json` с текущим source_key обязательны. Exit 0 и непустой лог
@@ -330,10 +381,11 @@ Sol-этап ограничен source: terminal `agent_end` с stopReason=stop 
 штатный `wt ui` на итоговых bytes и передаёт owned JSON:
 `wt finalize -- --resume <run-dir> --ui-proof <owned-ui-proof.json>`.
 Файл содержит только `ui` и, при необходимости, обновлённый `review`.
-Нужны status=verified, актуальный source_key, реальные scenarios и существующие
-PNG. Возобновление не запускает Sol снова; source/policy/context/artifact drift
-отклоняется. После влияющего hook нужен свежий proof; post-commit resume не
-создаёт повторный commit. Failed/OOM/timeout run нельзя возобновлять таким путём.
+Нужны status=verified, актуальный `feature-finalize --runtime-key`, реальные
+scenarios и существующие PNG. Возобновление не запускает Sol снова;
+source/policy/context/artifact drift отклоняется. После runtime-changing hook
+нужен свежий UI proof и актуальный review; post-commit resume не повторяет commit.
+Failed/OOM/timeout run нельзя возобновлять таким путём.
 
 Доказанный never-started resource admission сохраняет `awaiting_checks`;
 продолжение той же ревизии — `wt finalize -- --resume <run-dir>`.
@@ -344,7 +396,9 @@ Hotfix тоже проходит Sol по умолчанию. Только яв�
 разрешает `wt finalize -- --skip-sol --reason '<отказ>' --manifest <json>`;
 manifest содержит finite native tests/UI proof, не пустую заглушку.
 Это не отключает local proof, batch/apiBase или exact-SHA CI.
-Model phases конечны; OOM/timeout/infra failure не повторяются.
+Model/review работает до completion/cancellation без общего wall-clock kill;
+guard `--runtime 0`, внешний bash timeout0. OOM/infra failure не повторять
+автоматически; ограниченный tool-call timeout не должен убивать весь review.
 Один bounded correction pass допускается для подтверждённой ошибки исходника
 или успешного hook-autofix, не для ресурса. Непроверенный этап блокирует merge.
 
