@@ -10,7 +10,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 DRY=false
-[[ ${1:-} == --dry-run ]] && DRY=true
+INBOX_ONLY=false
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY=true ;;
+    --omp-inbox-only) INBOX_ONLY=true ;;
+  esac
+done
 
 link() {                       # link <источник в репе> <куда>
   local src="$REPO/$1" dst="$2"
@@ -31,6 +37,11 @@ link() {                       # link <источник в репе> <куда>
 if [[ ${1:-} == --omp-document ]]; then
   shift
   exec python3 "$REPO/omp/install-document.py" "$@"
+fi
+
+if $INBOX_ONLY; then
+  link omp/extensions/inbox "$HOME/.omp/agent/extensions/inbox"
+  exit 0
 fi
 
 # ── ~/.config ──────────────────────────────────────────────────────────────
@@ -81,6 +92,7 @@ link omp/lsp.json "$HOME/.omp/agent/lsp.json"
 link omp/extensions/statusline-path.ts "$HOME/.omp/agent/extensions/statusline-path.ts"
 link omp/extensions/document-markdown "$HOME/.omp/agent/extensions/document-markdown"
 link omp/extensions/prompt-card "$HOME/.omp/agent/extensions/prompt-card"
+link omp/extensions/inbox "$HOME/.omp/agent/extensions/inbox"
 link omp/extensions/image-links.ts "$HOME/.omp/agent/extensions/image-links.ts"
 link omp/extensions/jev-shadow.ts "$HOME/.omp/agent/extensions/jev-shadow.ts"
 link omp/herdr-local-files "$HOME/.local/share/omp/herdr-local-files"

@@ -3,19 +3,21 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUN="$(command -v bun)"
-OMP_CLI="$(readlink -f "$(command -v omp)")"
-OMP_MODULES="$(dirname "$OMP_CLI")"
-while [[ ! -f "$OMP_MODULES/@oh-my-pi/pi-tui/package.json" ]]; do
-  if [[ -f "$OMP_MODULES/node_modules/@oh-my-pi/pi-tui/package.json" ]]; then
-    OMP_MODULES="$OMP_MODULES/node_modules"
-    break
-  fi
-  if [[ $OMP_MODULES == / ]]; then
-    echo "Cannot locate installed OMP modules from $OMP_CLI" >&2
-    exit 1
-  fi
-  OMP_MODULES="$(dirname "$OMP_MODULES")"
-done
+if [[ -z "${OMP_MODULES:-}" ]]; then
+  OMP_CLI="$(readlink -f "$(command -v omp)")"
+  OMP_MODULES="$(dirname "$OMP_CLI")"
+  while [[ ! -f "$OMP_MODULES/@oh-my-pi/pi-tui/package.json" ]]; do
+    if [[ -f "$OMP_MODULES/node_modules/@oh-my-pi/pi-tui/package.json" ]]; then
+      OMP_MODULES="$OMP_MODULES/node_modules"
+      break
+    fi
+    if [[ $OMP_MODULES == / ]]; then
+      echo "Cannot locate installed OMP modules from $OMP_CLI" >&2
+      exit 1
+    fi
+    OMP_MODULES="$(dirname "$OMP_MODULES")"
+  done
+fi
 export FORCE_COLOR=3
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/omp-document-smoke.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
