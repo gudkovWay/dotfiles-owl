@@ -22,6 +22,8 @@
 
 import { goalFromModeData } from "@oh-my-pi/pi-coding-agent/goals/state";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { getLatestTodoPhasesFromEntries, phasesToMarkdown } from "@oh-my-pi/pi-coding-agent/tools/todo";
+import type { TodoItem, TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 
 /** One captured prompt. */
 export interface PromptRecord {
@@ -38,7 +40,7 @@ export interface PromptRecord {
 	timestamp: number;
 }
 
-/** Native goal-mode objective, shown on the objective tab when no pin exists. */
+/** Native goal-mode objective, independent of a local UI pin. */
 export interface CardGoal {
 	text: string;
 	paused: boolean;
@@ -53,6 +55,7 @@ export interface CardModel {
 	goal?: CardGoal;
 	/** Circle-progress motion; branch-local preference. */
 	motion: boolean;
+	plan: CardPlan;
 }
 
 export interface CardSnapshot {
@@ -61,9 +64,54 @@ export interface CardSnapshot {
 	pending: boolean;
 	waiting: boolean;
 	frame: number;
+	session: { id: string; cwd: string; name?: string; model?: string; effort?: string };
+	/** Runtime reference only: no claim that the file exists or was approved. */
+	planReference?: string;
 }
 
-export type CardSection = "submitted" | "responding" | "objective";
+export type CardSection = "submitted" | "objective" | "plan" | "session";
+
+export interface CardPlan {
+	phases: TodoPhase[];
+	markdown?: string;
+	display: string;
+	total: number;
+	completed: number;
+	blocked: number;
+	abandoned: number;
+	current?: TodoItem;
+}
+
+const TASK_MARKS: Record<TodoItem["status"], string> = {
+	completed: "✓", in_progress: "▶", pending: "□", blocked: "!", abandoned: "×",
+};
+
+/** Derive presentation once per canonical snapshot, not on animation frames. */
+export function readCardPlan(phases: TodoPhase[]): CardPlan {
+	let total = 0, completed = 0, blocked = 0, abandoned = 0;
+	let active: TodoItem | undefined;
+	let firstBlocked: TodoItem | undefined;
+	let pending: TodoItem | undefined;
+	const lines: string[] = [];
+	for (const phase of phases) {
+		if (phase.tasks.length === 0) continue;
+		lines.push(phase.name);
+		for (const task of phase.tasks) {
+			total++;
+			if (task.status === "completed") completed++;
+			else if (task.status === "abandoned") abandoned++;
+			else if (task.status === "blocked") { blocked++; firstBlocked ??= task; }
+			else if (task.status === "in_progress") active ??= task;
+			else pending ??= task;
+			lines.push(`${TASK_MARKS[task.status]} ${task.content}${task.blocker ? ` · блокер: ${task.blocker}` : ""}`);
+		}
+	}
+	return {
+		phases, total, completed, blocked, abandoned, current: active ?? firstBlocked ?? pending,
+		markdown: total > 0 ? phasesToMarkdown(phases) : undefined,
+		display: lines.join("\n"),
+	};
+}
 
 /** Custom entry type: last user-submitted prompt. */
 export const SUBMITTED_ENTRY = "q.prompt-card.submitted";
@@ -116,7 +164,7 @@ const TERMINAL_GOAL_STATUSES: Record<string, true> = { complete: true, dropped: 
  *   only by an actual goal-mode exit (`mode: "none"` while a goal mode was
  *   live), never by an unrelated mode change such as plan or vibe toggling.
  */
-export function readCardModel(entries: readonly SessionEntry[]): CardModel {
+export function readCardModel(entries: readonly SessionEntry[], livePhases?: TodoPhase[]): CardModel {
 	let submitted: PromptRecord | undefined;
 	let responding: PromptRecord | undefined;
 	let respondingFromMetadata = false;
@@ -130,6 +178,7 @@ export function readCardModel(entries: readonly SessionEntry[]): CardModel {
 		if (entry.type === "reset_boundary") {
 			submitted = undefined;
 			responding = undefined;
+
 			respondingFromMetadata = false;
 			messageResponding = undefined;
 			pin = undefined;
@@ -206,12 +255,25 @@ export function readCardModel(entries: readonly SessionEntry[]): CardModel {
 
 	if (!respondingFromMetadata && messageResponding) responding = messageResponding;
 
-	const model: CardModel = { motion };
+	// The canonical helper does not mutate its branch argument.
+	const plan = readCardPlan(livePhases ?? getLatestTodoPhasesFromEntries(entries as SessionEntry[]));
+	const model: CardModel = { motion, plan };
 	if (submitted) model.submitted = submitted;
 	if (responding) model.responding = responding;
 	if (pin !== undefined) model.pin = pin;
 	if (goal) model.goal = goal;
 	return model;
+}
+
+/** Latest runtime-observed plan path; never implies file existence or approval. */
+export function readPlanReference(entries: readonly SessionEntry[]): string | undefined {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type !== "mode_change" || entry.mode !== "plan") continue;
+		const reference = entry.data?.planFilePath;
+		if (typeof reference === "string" && reference.length > 0) return reference;
+	}
+	return undefined;
 }
 
 /**
@@ -251,19 +313,16 @@ export function recordFromContent(content: unknown, timestamp: number): PromptRe
 	return { text, images, timestamp: submittedAt };
 }
 
-/**
- * The exact original text of a section, for clipboard and pinning.
- *
- * `objective` prefers the explicit local pin and falls back to the real goal
- * objective. Returns `undefined` when the section holds no copyable text (an
- * image-only prompt has no text to copy).
- */
+/** Clipboard content: originals for prompts, both distinct objectives, canonical Todo, or full UUID. */
 export function sectionText(snapshot: CardSnapshot, section: CardSection): string | undefined {
 	const { model } = snapshot;
 	let candidate: string | undefined;
-	if (section === "submitted") candidate = model.submitted?.text;
-	else if (section === "responding") candidate = model.responding?.text;
-	else if (section === "objective") candidate = model.pin ?? model.goal?.text;
+	if (section === "submitted") candidate = (model.submitted ?? model.responding)?.text;
+	else if (section === "objective") {
+		if (model.goal && model.pin !== undefined) candidate = `Цель OMP: ${model.goal.text}\nЛокальный закреп: ${model.pin}`;
+		else candidate = model.goal?.text ?? model.pin;
+	} else if (section === "plan") candidate = model.plan.markdown;
+	else if (section === "session") candidate = snapshot.session.id;
 	return candidate !== undefined && candidate.trim().length > 0 ? candidate : undefined;
 }
 
