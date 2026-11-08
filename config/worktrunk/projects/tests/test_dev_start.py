@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Native unittest regressions for the reviewed dev preparation boundary."""
+from contextlib import ExitStack
 import importlib
 import json
+import socket
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -61,6 +64,82 @@ class StartupTests(unittest.TestCase):
         with patch.object(self.dev.subprocess, 'check_output', return_value=json.dumps(value)) as call:
             self.assertEqual(self.dev.status('admin-ui'), value)
             self.assertNotIn('--install', call.call_args.args[0])
+
+
+class LocalhostPortTests(unittest.TestCase):
+    def setUp(self):
+        self.dev = importlib.import_module('dev_support')
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.runtime = Path(self.tmp.name)
+
+    def lease(self, preferred=3000, repository='p2p'):
+        return self.dev.localhost_port(repository, preferred, runtime=self.runtime)
+
+    def test_first_free_allowed_port_is_selected(self):
+        with patch.object(self.dev, 'port_available', side_effect=lambda port: port != 3000):
+            with self.lease() as port:
+                self.assertEqual(port, 3001)
+
+    def test_explicit_allowed_preference_is_honored(self):
+        with patch.object(self.dev, 'port_available', return_value=True):
+            with self.lease(3002) as port:
+                self.assertEqual(port, 3002)
+
+    def test_three_launchers_reserve_distinct_ports_and_fourth_is_deferred(self):
+        with patch.object(self.dev, 'port_available', return_value=True), ExitStack() as leases:
+            ports = [leases.enter_context(self.lease()) for _ in range(3)]
+            self.assertEqual(ports, [3000, 3001, 3002])
+            with self.assertRaisesRegex(self.dev.Busy, '3000, 3001, 3002'):
+                leases.enter_context(self.lease())
+
+    def test_failed_start_releases_its_port_without_removing_lock_file(self):
+        with patch.object(self.dev, 'port_available', return_value=True):
+            with self.assertRaisesRegex(RuntimeError, 'startup failed'):
+                with self.lease():
+                    raise RuntimeError('startup failed')
+            lock = self.runtime / 'omp-p2p-localhost/3000.lock'
+            inode = lock.stat().st_ino
+            with self.lease() as port:
+                self.assertEqual(port, 3000)
+                self.assertEqual(lock.stat().st_ino, inode)
+
+    def test_all_foreign_listeners_defer_without_random_port(self):
+        with patch.object(self.dev, 'port_available', return_value=False) as available:
+            with self.assertRaises(self.dev.Busy):
+                with self.lease():
+                    self.fail('all ports are occupied')
+            self.assertEqual([call.args[0] for call in available.call_args_list],
+                             [3000, 3001, 3002])
+
+    def test_unapproved_explicit_port_is_rejected_before_probing(self):
+        with patch.object(self.dev, 'port_available') as available:
+            with self.assertRaisesRegex(RuntimeError, '3000, 3001, 3002'):
+                with self.lease(56777):
+                    self.fail('unapproved origin')
+            available.assert_not_called()
+
+    def test_other_repository_keeps_its_requested_free_port_without_p2p_lock(self):
+        with patch.object(self.dev, 'port_available', return_value=True):
+            with self.lease(17960, 'ecom') as port:
+                self.assertEqual(port, 17960)
+            self.assertFalse((self.runtime / 'omp-p2p-localhost').exists())
+
+    def test_real_listener_is_not_available(self):
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            self.assertFalse(self.dev.port_available(listener.getsockname()[1]))
+
+    def test_p2p_native_command_cannot_take_over_or_choose_another_port(self):
+        command = self.dev.nuxt_dev_command('payscrow-admin', 3001, 'p2p')
+        self.assertEqual(command, [
+            'npm', 'run', 'dev', '-w', 'payscrow-admin', '--',
+            '--host', '127.0.0.1', '--port', '3001', '--strictPort', '--no-takeover',
+        ])
+        other = self.dev.nuxt_dev_command('payscrow-admin', 17960, 'ecom')
+        self.assertNotIn('--strictPort', other)
+        self.assertNotIn('--no-takeover', other)
 
 
 if __name__ == '__main__':

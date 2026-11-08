@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the selected reviewed Nuxt app, then serve in one finite owned scope."""
+"""Prepare the selected reviewed Nuxt app, then serve until stopped or an explicit expiry."""
 import argparse
 import json
 import os
@@ -7,7 +7,10 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-from dev_support import ensure_environment, profile_for
+import time
+from dev_support import (ensure_environment, localhost_port, nuxt_dev_command,
+                         nuxt_environment, profile_for, wait_ready, wait_finite,
+                         WARM_GUARD_MEMORY, resource_snapshot)
 from resource_guard import assert_guarded
 
 GUARD = Path(__file__).resolve().parent / 'guarded-run'
@@ -33,44 +36,53 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--app', required=True)
     parser.add_argument('--port', type=int, required=True)
-    parser.add_argument('--seconds', type=int, default=480)
+    parser.add_argument('--seconds', type=int, default=0, help='0 keeps the manual preview alive until stopped')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--inside', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not 1 <= args.port <= 65535 or not 30 <= args.seconds <= 540:
-        parser.error('port must be 1..65535; seconds must be 30..540')
+    if not 1 <= args.port <= 65535 or not (args.seconds == 0 or 30 <= args.seconds <= 540):
+        parser.error('port must be 1..65535; seconds must be 0 (until stop) or 30..540')
     profile = profile_for(args.app)
     root = Path(subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip()).resolve()
     os.chdir(root)
     if (root / '.git').is_dir() or not (root / 'apps' / args.app).is_dir():
         raise RuntimeError('use an owned linked worktree containing the selected app')
-    native = ['npm', 'run', 'dev', '-w', args.app, '--', '--host', '127.0.0.1', '--port', str(args.port)]
+    native = nuxt_dev_command(args.app, args.port, 'p2p')
     command = [sys.executable, str(Path(__file__).resolve()), '--inside', '--app', args.app,
                '--port', str(args.port), '--seconds', str(args.seconds)]
-    guarded = [str(GUARD), '--need', '6G', '--wait', '60', '--exclusive-key', str(root)]
+    guarded = [str(GUARD), *WARM_GUARD_MEMORY, '--tasks', '512', '--wait', '60',
+               '--runtime', '0' if args.seconds == 0 else str(args.seconds + 30), '--exclusive-key', str(root)]
     if args.dry_run:
         current = ensure_environment(profile, prepare=False)
         print(json.dumps({'app': args.app, 'profile': profile, 'readiness': current,
-                          'preparation': 'reuse ready inputs; otherwise audited install + targeted prepare before dev',
+                          'preparation': 'cold audited preparation before admission; warm scope only reuses ready inputs',
                           'command': native, 'seconds': args.seconds}), flush=True)
         return subprocess.call([*guarded, '--dry-run', '--', *command])
     if not args.inside:
+        ensure_environment(profile)
         os.execv(str(GUARD), [*guarded, '--', *command])
     assert_guarded()
-    ensure_environment(profile)
-    process = subprocess.Popen(native, start_new_session=True)
-    def interrupted(_signum, _frame):
-        raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, interrupted)
-    signal.signal(signal.SIGINT, interrupted)
-    try:
+    with localhost_port('p2p', args.port) as port:
+        print(json.dumps({'url': f'http://localhost:{port}'}), flush=True)
+        current = ensure_environment(profile, prepare=False)
+        if current['dependencies'] != 'ready' or current['generated'] != 'ready':
+            raise RuntimeError('environment not ready after warm admission; cold preparation required')
+        deadline = time.monotonic() + args.seconds if args.seconds else None
+        process = subprocess.Popen(nuxt_dev_command(args.app, port, 'p2p'),
+                                   env=nuxt_environment(os.environ, 'p2p'), start_new_session=True)
+        def interrupted(_signum, _frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, interrupted)
+        signal.signal(signal.SIGINT, interrupted)
         try:
-            return process.wait(timeout=args.seconds)
-        except subprocess.TimeoutExpired:
-            print('dev-session: finite session complete; stopping owned server', flush=True)
-            return 0
-    finally:
-        stop(process)
+            wait_ready(process, port, deadline, root, args.app, 'preview')
+            return wait_finite(process, deadline)
+        finally:
+            try:
+                print(json.dumps({'event': 'profile_resources', 'phase': 'warm',
+                                  'profile': 'dev', 'resources': resource_snapshot()}), flush=True)
+            finally:
+                stop(process)
 
 
 if __name__ == '__main__':
@@ -80,4 +92,4 @@ if __name__ == '__main__':
         raise SystemExit(130)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print('dev-session: refusing: ' + str(error), file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(error.returncode if isinstance(error, subprocess.CalledProcessError) else getattr(error, 'code', 1))

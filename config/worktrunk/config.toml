@@ -3,11 +3,19 @@ worktree-path = "{{ repo_path }}/../.worktrees/{{ repo }}/{{ branch }}"
 
 [projects."gitlab.psclp.org/common/frontend/frontend"]
 
+# Stand name is the branch: dyn-env publishes `$CI_COMMIT_REF_SLUG`, which GitLab
+# shortens to 63 bytes. Any longer DEV-* branch would deploy under a truncated,
+# collision-prone name, so a new one is refused before the worktree exists.
+[projects."gitlab.psclp.org/common/frontend/frontend".pre-switch]
+branch-limit = "/home/q/.config/worktrunk/projects/branch-name-limit \"{{ branch }}\""
+
 # Write only the Payscrow LK backend override; frontend branch is not a backend deployment.
 [projects."gitlab.psclp.org/common/frontend/frontend".pre-start]
 env = "/home/q/.config/worktrunk/projects/p2p-frontend/pre-start-env {{ branch }}"
+linear-skill = "python3 /home/q/.config/worktrunk/projects/p2p-frontend/linear_workflow.py ensure --root {{ worktree_path }}"
 
 [projects."gitlab.psclp.org/common/frontend/frontend".aliases]
+linear = "python3 /home/q/.config/worktrunk/projects/p2p-frontend/linear_workflow.py {{ args }}"
 # GitLab MR with apiBase guard; GitLab only — never `wt merge` for p2p.
 mr = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain /home/q/.config/worktrunk/projects/p2p-frontend/mr {{ args }}"
 # Ordinary commits stay strict; an explicit batch defers reviewed pre-commit tasks.
@@ -15,11 +23,11 @@ commit = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain sh /home/q/.
 batch = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain /home/q/.config/worktrunk/projects/p2p-frontend/batch {{ args }}"
 push = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain sh /home/q/.config/worktrunk/projects/p2p-frontend/push {{ args }}"
 stand = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain python3 /home/q/.config/worktrunk/projects/p2p-frontend/stand {{ args }}"
-# Sol high plan/refactor and exact-SHA CI; stop at open MR unless --merge.
+# Sol high plan/refactor, native checks, push and exact-SHA CI; stop at open MR unless --merge.
 finalize = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain python3 /home/q/.config/worktrunk/projects/p2p-frontend/feature-finalize {{ args }}"
 
-# Finite capped dev server; still tethered to this worktree.
-dev = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain wt step tether -- sh /home/q/.config/worktrunk/projects/p2p-frontend/dev-server {{ branch | hash_port }} {{ args }}"
+# Finite guarded preview; leases localhost:3000/3001/3002 and propagates exit status.
+dev = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain sh /home/q/.config/worktrunk/projects/p2p-frontend/dev-server 3000 {{ args }}"
 
 # `wt deps` — explicit on-demand `npm ci`; editing a worktree never needs it,
 # so it is not a hook and never gates worktree creation.
@@ -33,6 +41,11 @@ typecheck = "/home/q/.config/worktrunk/projects/p2p-frontend/toolchain python3 /
 # It deliberately has no cascade .env pre-start hook: p2p's NUXT_PUBLIC_API_BASE
 # rewriting is p2p-only and must not leak here.
 [projects."gitlab.psclp.org/ecom/frontend/frontend"]
+
+# Same dyn-env stand naming rule as p2p: a new DEV-* branch above 63 characters
+# is refused before the worktree exists.
+[projects."gitlab.psclp.org/ecom/frontend/frontend".pre-switch]
+branch-limit = "/home/q/.config/worktrunk/projects/branch-name-limit \"{{ branch }}\""
 
 [projects."gitlab.psclp.org/ecom/frontend/frontend".aliases]
 # Same on-demand action and name as p2p; still never runs on worktree creation.

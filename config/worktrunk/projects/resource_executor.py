@@ -1,5 +1,6 @@
 """Owned launch lifecycle: one registry, queued admission and pre-OOM growth."""
 import errno
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -14,6 +15,14 @@ import uuid
 from resource_policy import (GIB, STEP, MAX_JOBS, DEFAULT_TASKS, admit_tasks, GuardError, Busy, allocate_memory,
     admission, free_capacity, enqueue, queue_choice, estimate_wait, pressure_action,
     jitter_margin, round_up)
+
+
+def admission_receipt(event, unit, reason, details, **fields):
+    print(json.dumps(dict(event=event, job_id=unit, reason=reason,
+                          timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                          monotonic_seconds=time.monotonic(),
+                          boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                          **details, **fields)), flush=True)
 
 
 def check_ticket(filename, cwd):
@@ -212,6 +221,7 @@ def execute(args, command, options, base):
             if lease and now-last_check >= 5:
                 check_ticket(args.goal_ticket, cwd)
                 last_check = now
+            accounting = {}
             try:
                 with registry.lock() as lock_fd:
                     backend.infrastructure()
@@ -221,9 +231,11 @@ def execute(args, command, options, base):
                     if unit in state['jobs']:
                         raise GuardError('job-id already running; do not submit duplicate work')
                     if any(j.get('policy_version', 1) != 2 for j in state['jobs'].values()):
-                        raise Busy('cutover: waiting for legacy scopes to drain without changing their caps')
+                        raise Busy('cutover: waiting for legacy scopes to drain without changing their caps',
+                                   reason_code='cutover')
                     if any('tasks' not in job for job in state['jobs'].values()):
-                        raise Busy('cutover: waiting for pre-PID-accounting controllers to drain')
+                        raise Busy('cutover: waiting for pre-PID-accounting controllers to drain',
+                                   reason_code='cutover')
                     recover_growth(state, backend, registry, base)
                     available = base.mem_available()
                     jitter = jitter_margin(samples, now, available)
@@ -243,12 +255,22 @@ def execute(args, command, options, base):
                     state['policy_version'] = 2
                     registry.save(state)
                     free = free_capacity(state, available, usage, jitter)
+                    accounting = dict(available_bytes=available, host_floor_bytes=GIB,
+                        jitter_bytes=jitter, unused_promises_bytes=base.reservation_headroom(state, usage),
+                        free_capacity_bytes=free, required_bytes=required,
+                        accounting_monotonic_seconds=now, queue_length=len(state['queue']),
+                        active_jobs=[dict(job_id=name, memory_bytes=job['limit'],
+                            working_bytes=usage[name],
+                            unused_promise_bytes=max(0, max(job['limit'], job.get('pending_limit', 0)) - usage[name]))
+                            for name, job in state['jobs'].items()])
                     occupied = {k for j in state['jobs'].values() for k in j['keys']}
-                    chosen = queue_choice(state, free, occupied, now)
-                    if chosen != unit:
-                        admit_tasks(state, tasks)
+                    decision = queue_choice(state, free, occupied, now, request=unit)
+                    if decision['selected'] != unit:
                         eta = estimate_wait(state, unit, free, now)
-                        raise Busy('queued: eta=' + ('unknown' if eta is None else str(eta)))
+                        detail = {key: value for key, value in decision.items() if key != 'selected'}
+                        detail['eta_seconds'] = eta
+                        raise Busy(f'{detail["reason_code"]}: required={required}; free={free}; '
+                                   f'blocker={detail.get("blocking_job_id")}', **detail)
                     admit_tasks(state, tasks)
                     budget, limit, high = allocate_memory(state, available, args.memory, usage, need=need, jitter=jitter)
                     if authority and limit > authority['resources']['memory_ceiling']:
@@ -277,20 +299,18 @@ def execute(args, command, options, base):
                 print(json.dumps(dict(event='admitted', job_id=unit, memory=limit, ceiling=ceiling, tasks=tasks)), flush=True)
                 break
             except Busy as exc:
+                exc.details = {**accounting, **exc.details}
                 if time.monotonic() >= deadline:
                     raise
                 reason = str(exc)
-                if reason != last_print:
-                    print(json.dumps(dict(event='queued', job_id=unit, reason=reason)), flush=True)
-                    last_print = reason
-                # ETA changes polling cadence, never the authority/wait deadline.
-                # Keep revocation responsive even when completion time is unknown.
-                delay = .5 if 'eta=' not in reason else 2
-                if 'eta=' in reason:
-                    try:
-                        delay = max(.5, min(5, float(reason.rsplit('=', 1)[1])/8))
-                    except ValueError:
-                        pass
+                signature = (exc.details['reason_code'], exc.details.get('blocking_job_id'),
+                             tuple(exc.details.get('blocked_keys', [])),
+                             exc.details.get('free_capacity_bytes', 0) // STEP)
+                if signature != last_print:
+                    admission_receipt('queued', unit, reason, exc.details)
+                    last_print = signature
+                eta = exc.details.get('eta_seconds')
+                delay = .5 if eta is None else max(.5, min(5, eta / 8))
                 time.sleep(min(delay, max(0, deadline-time.monotonic())))
         finish = min(expires, time.monotonic()+args.runtime+10) if isinstance(args.runtime, int) else expires
         while True:
@@ -317,9 +337,9 @@ def execute(args, command, options, base):
         return code
     except Busy as exc:
         if not reserved and launcher is None:
-            print(json.dumps(dict(event='deferred', job_id=unit, phase='admission',
-                                  workload=digest, workload_started=False, admitted=False,
-                                  reason=str(exc), admission_windows=windows)), flush=True)
+            admission_receipt('deferred', unit, str(exc), exc.details,
+                              phase='admission', workload=digest, workload_started=False,
+                              admitted=False, admission_windows=windows)
         raise
     finally:
         if reserved:

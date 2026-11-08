@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """Finite loopback Nuxt + owned headless Chromium CDP, inside the shared guard."""
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import signal
-import re
 import stat
-import socket
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from resource_guard import assert_guarded
-from dev_support import ensure_environment
+from dev_support import (ensure_environment, localhost_port, nuxt_dev_command,
+                         nuxt_environment, wait_ready, WARM_GUARD_MEMORY,
+                         resource_snapshot)
 
 HERE = Path(__file__).resolve().parent
 GUARD = HERE / 'guarded-run'
@@ -95,13 +95,6 @@ def head_identity(git_dir, common_dir):
     raise RuntimeError('cannot resolve owned worktree HEAD without spawning a process')
 
 
-def resource_snapshot():
-    relative = Path('/proc/self/cgroup').read_text().strip().split('::', 1)[1]
-    directory = Path('/sys/fs/cgroup') / relative.lstrip('/')
-    return {name: (directory / name).read_text().strip()
-            for name in ['pids.current', 'pids.max', 'pids.peak', 'pids.events',
-                         'memory.current', 'memory.peak', 'memory.events']
-            if (directory / name).is_file()}
 
 
 def stop(process):
@@ -123,44 +116,13 @@ def stop(process):
     process.wait()
 
 
-def port_available(port):
-    with socket.socket() as sock:
-        try:
-            sock.bind(('127.0.0.1', port))
-            return True
-        except OSError:
-            return False
-
-
-def owned_listener(port, leader):
-    output = subprocess.check_output(['ss', '-H', '-lptn', f'sport = :{port}'], text=True)
-    if not output.strip():
-        return False
-    expected = Path('/proc/self/cgroup').read_text()
-    for row in output.splitlines():
-        if f'127.0.0.1:{port}' not in row:
-            raise RuntimeError('listener is not restricted to the selected loopback origin')
-        pids = re.findall(r'pid=(\d+)', row)
-        if not pids:
-            raise RuntimeError('cannot prove listener ownership')
-        for value in pids:
-            pid = int(value)
-            if Path(f'/proc/{pid}/cgroup').read_text() != expected:
-                raise RuntimeError('port belongs to a foreign cgroup')
-            seen = set()
-            while pid != leader and pid > 1 and pid not in seen:
-                seen.add(pid)
-                pid = int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[1])
-            if pid != leader:
-                raise RuntimeError('port is not owned by the launched server tree')
-    return True
 
 
 def interrupted(_signum, _frame):
     raise KeyboardInterrupt
 
 
-def main():
+def main(leases):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--seconds', type=int, default=480)
     p.add_argument('--app', choices=APPS, default='payscrow-admin',
@@ -181,15 +143,19 @@ def main():
     if args.dry_run:
         status = json.loads(subprocess.check_output([str(ENVIRONMENT), '--profile', profile], text=True))
         print(json.dumps({'app': args.app, 'authentication': authentication(status['repository'], args.app, Path.home())}, ensure_ascii=False), flush=True)
-        subprocess.run([str(GUARD), '--dry-run', '--need', '6G', '--wait', '60',
+        memory = WARM_GUARD_MEMORY if status['repository'] == 'p2p' else ('--need', '6G')
+        subprocess.run([str(GUARD), '--dry-run', *memory, '--tasks', '512', '--wait', '60',
                         '--exclusive-key', str(root), '--', *command], check=True)
         return
     if not args.inside:
-        os.execv(str(GUARD), [str(GUARD), '--need', '6G', '--wait', '60',
+        status = ensure_environment(profile, prepare=False)
+        if status['repository'] == 'p2p':
+            ensure_environment(profile)
+        memory = WARM_GUARD_MEMORY if status['repository'] == 'p2p' else ('--need', '6G')
+        os.execv(str(GUARD), [str(GUARD), *memory, '--tasks', '512', '--wait', '60',
                             '--exclusive-key', str(root), '--', *command])
     assert_guarded()
-    # Check external prerequisites before installing anything. Preparation and
-    # server/browser share the admitted scope and its exclusive worktree key.
+    # Recheck readiness under the warm reservation; never install in this scope.
     status = json.loads(subprocess.check_output([str(ENVIRONMENT), '--profile', profile], text=True))
     auth = authentication(status['repository'], args.app, Path.home())
     chromium = shutil.which('chromium')
@@ -206,14 +172,10 @@ def main():
         raise RuntimeError('worktree identity changed during initialization')
     if not git('rev-parse', '--git-common-dir') or (root / '.git').is_dir():
         raise RuntimeError('use an explicitly owned linked worktree, not the root checkout')
-    status = ensure_environment(profile, prepare=status['repository'] == 'p2p')
+    port = leases.enter_context(localhost_port(status['repository'], args.port))
+    status = ensure_environment(profile, prepare=False)
     if status['dependencies'] != 'ready' or status['generated'] != 'ready':
         raise RuntimeError('environment not ready: ' + json.dumps(status, ensure_ascii=False))
-    port = args.port
-    if not port_available(port):
-        with socket.socket() as sock:
-            sock.bind(('127.0.0.1', 0))
-            port = sock.getsockname()[1]
     deadline = time.monotonic() + args.seconds
     server = browser = None
     signal.signal(signal.SIGTERM, interrupted)
@@ -245,24 +207,14 @@ def main():
                     'authentication': auth,
                     'source_diff_sha256': hashlib.sha256(subprocess.check_output(['git', 'diff', 'HEAD'])).hexdigest(),
                     'url': url, 'stop_file': str(stop_file), 'artifacts': str(artifacts), 'deadline_seconds': args.seconds,
+                    'mode': 'ui-check', 'expires_at': time.time() + max(0, deadline - time.monotonic()),
                     'verification': 'not exercised; launcher readiness is not screen verification'}
         try:
             with (artifacts / 'server.log').open('w') as server_log, (artifacts / 'browser.log').open('w') as browser_log:
-                server = subprocess.Popen([*bus, 'npm', 'run', 'dev', '-w', args.app, '--', '--host', '127.0.0.1', '--port', str(port)], env=environment, stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
-                while True:
-                    if server.poll() is not None:
-                        raise RuntimeError(f'owned server exited ({server.returncode}); inspect server.log; no automatic retry')
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError('server readiness deadline exceeded; no automatic retry')
-                    if not owned_listener(port, server.pid):
-                        time.sleep(0.2)
-                        continue
-                    try:
-                        with urllib.request.urlopen(url, timeout=1) as response:
-                            if response.status == 200 and owned_listener(port, server.pid):
-                                break
-                    except OSError:
-                        time.sleep(0.2)
+                server = subprocess.Popen([*bus, *nuxt_dev_command(args.app, port, status['repository'])],
+                                          env=nuxt_environment(environment, status['repository']),
+                                          stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
+                wait_ready(server, port, deadline, root, args.app, 'ui-check')
                 if args.capture:
                     capture = [*bus, chromium, '--headless=new',
                                '--user-data-dir=' + str(dirs['browser']), '--no-first-run',
@@ -279,6 +231,7 @@ def main():
                     if result or not (artifacts / 'entry.png').is_file():
                         raise RuntimeError(f'entry-page capture failed ({result}); no automatic retry')
                     manifest['verification'] = 'entry page captured only; inspect image and DOM; protected screen remains unverified'
+                    manifest['termination_reason'] = 'entry-captured'
                     print(json.dumps(manifest, ensure_ascii=False), flush=True)
                     return
                 browser = subprocess.Popen([*bus, chromium, '--headless=new', '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0', '--user-data-dir=' + str(dirs['browser']), '--no-first-run', '--no-default-browser-check', '--disable-background-networking', '--disable-sync', '--disable-extensions', '--password-store=basic', url], env=environment, stdout=browser_log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -300,9 +253,15 @@ def main():
                     time.sleep(0.2)
                 if not stop_file.exists():
                     raise RuntimeError('UI session deadline reached; do not automatically retry')
+                manifest['termination_reason'] = 'stop-requested'
+        except BaseException as error:
+            manifest['termination_reason'] = str(error) or type(error).__name__
+            raise
         finally:
             try:
                 manifest['resources'] = resource_snapshot()
+                print(json.dumps({'event': 'profile_resources', 'phase': 'warm',
+                                  'profile': 'ui', 'resources': manifest['resources']}), flush=True)
             except (OSError, ValueError) as error:
                 manifest['resources_unavailable'] = str(error)
             stop(browser)
@@ -313,9 +272,10 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        with ExitStack() as leases:
+            main(leases)
     except KeyboardInterrupt:
         raise SystemExit(130)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print('ui-session: refusing: ' + str(error), file=sys.stderr)
-        raise SystemExit(getattr(error, 'code', 1))
+        raise SystemExit(getattr(error, 'returncode', getattr(error, 'code', 1)))

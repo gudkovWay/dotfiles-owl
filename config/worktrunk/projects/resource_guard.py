@@ -75,7 +75,7 @@ def validate_node_command(command, limit):
 
 def claim_key(state, unit, key):
     if any(name != unit and key in job['keys'] for name, job in state['jobs'].items()):
-        raise Busy(f'environment_busy: {key}')
+        raise Busy(f'environment_busy: {key}', reason_code='environment_busy', blocked_keys=[key])
     keys = state['jobs'][unit]['keys']
     if key not in keys:
         keys.append(key)
@@ -228,7 +228,7 @@ class Registry:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise Busy('resource_busy: admission lock occupied') from exc
+                raise Busy('resource_busy: admission lock occupied', reason_code='admission_lock') from exc
             yield fd
         finally:
             os.close(fd)
@@ -350,7 +350,8 @@ class Systemd:
             raise GuardError('cgroup v2 cpu/memory/pids controllers unavailable')
         self.command('show-environment')
         if self.populated('omp-heavy-job.scope'):
-            raise Busy('resource_busy: legacy fixed scope still active; cutover waits for its owner')
+            raise Busy('resource_busy: legacy fixed scope still active; cutover waits for its owner',
+                       reason_code='cutover')
 
 
 def reconcile(state, backend):
@@ -608,7 +609,8 @@ def main():
     parser.add_argument('--elastic', action='store_true', help='permit admitted live growth before OOM')
     parser.add_argument('--ceiling', type=parse_memory, help='elastic authority ceiling, not a reservation')
     parser.add_argument('--goal-ticket', help='broker-issued descendant ticket file')
-    parser.add_argument('--runtime', type=int, default=DEFAULT_RUNTIME)
+    parser.add_argument('--runtime', type=int, default=DEFAULT_RUNTIME,
+                        help='seconds; 0 disables total lifetime for an authorized managed agent/service')
     parser.add_argument('--job-id', help='stable idempotency key for a supervised request')
     parser.add_argument('--gpu-key', help='exclusive GPU/display resource name')
     parser.add_argument('--status', action='store_true', help='show owned queue and active accounting')
@@ -633,7 +635,7 @@ def main():
         with registry.lock():
             print(json.dumps(registry.load()))
         return 0
-    if args.wait < 0 or not 1 <= args.runtime <= 28800:
+    if args.wait < 0 or not 0 <= args.runtime <= 28800:
         parser.error('invalid wait/runtime')
     if (args.wait > 60 or args.runtime > DEFAULT_RUNTIME) and not args.goal_ticket:
         parser.error('long wait/runtime requires a broker-issued goal ticket')
@@ -646,7 +648,7 @@ def main():
             raise GuardError('--approved-double requires an explicit --memory base; adaptive maximum cannot be doubled')
         args.memory *= 2
         args.runtime *= 2
-    if args.approved_no_timeout:
+    if args.approved_no_timeout or args.runtime == 0:
         args.runtime = 'infinity'
     if args.check_inside:
         print('guarded-run: verified ' + assert_guarded())
@@ -665,6 +667,8 @@ def main():
         with registry.lock():
             nested_job = registry.load()['jobs'][unit]
             limit = nested_job.get('ceiling', nested_job['limit']) if nested_job.get('elastic') else nested_job['limit']
+        if args.runtime == 'infinity' and nested_job.get('runtime', DEFAULT_RUNTIME) != 'infinity':
+            raise GuardError('nested command cannot extend parent runtime')
         if args.tasks is not None and args.tasks > nested_job.get('tasks', DEFAULT_TASKS):
             raise GuardError('nested command cannot increase its task cap')
         if (explicit_memory and args.memory > limit) or (args.need and args.need > limit):
