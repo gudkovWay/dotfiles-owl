@@ -27,24 +27,26 @@ set -euo pipefail
 # полночь -> NIGHT_BOTTOM, затем дно ДЕРЖИТСЯ до NIGHT_RISE, и только потом
 # начинается подъём до NIGHT_END. Поэтому интервалы считаются в модульной
 # арифметике +1440, а не «наивным» сравнением минут.
-NIGHT_START="${NIGHT_START:-18:00}"      # начало спуска
-NIGHT_BOTTOM="${NIGHT_BOTTOM:-22:00}"    # момент достижения дна
-NIGHT_RISE="${NIGHT_RISE:-03:30}"        # конец удержания дна, начало подъёма
-NIGHT_END="${NIGHT_END:-06:00}"          # возврат к 100%
-NIGHT_MIN_FACTOR="${NIGHT_MIN_FACTOR:-0.72}"
+NIGHT_START="${NIGHT_START:-17:00}"      # начало спуска
+NIGHT_BOTTOM="${NIGHT_BOTTOM:-21:00}"    # момент достижения дна
+NIGHT_RISE="${NIGHT_RISE:-04:00}"        # конец удержания дна, начало подъёма
+NIGHT_END="${NIGHT_END:-06:30}"          # возврат к 100%
+NIGHT_MIN_FACTOR="${NIGHT_MIN_FACTOR:-0.5832}" # предыдущий минимум 0.648 минус 10%
 NIGHT_TEMP_DAY="${NIGHT_TEMP_DAY:-6500}"
 NIGHT_TEMP_NIGHT="${NIGHT_TEMP_NIGHT:-4500}"
 NIGHT_TEMP_STEP="${NIGHT_TEMP_STEP:-50}" # квант температуры, K
 NIGHT_RGB_STEP="${NIGHT_RGB_STEP:-0.01}" # квант фактора для LED
-# Пары "модель монитора:база", разделённые «;». Модель — как в `ddcutil
-# detect` (EDID Model), выбор дисплея идёт через `ddcutil --model`: он не
-# зависит от порядка нумерации i2c-шин после ребута. База — дневная яркость
-# по шкале VCP 0..100; ночная цель = round(база * фактор).
+# Записи "модель:дневная база[:ночная яркость]", разделённые «;». Модель —
+# как в `ddcutil detect` (EDID Model), выбор через `ddcutil --model` не
+# зависит от порядка i2c-шин. Значения — по шкале VCP 0..100.
+# Без отдельной ночной яркости цель = round(база * фактор); с ней —
+# плавный переход от дневной базы к указанному ночному минимуму.
 # Шкалы VCP у мониторов несравнимы (MSI при 70 визуально темнее Xiaomi при
-# 14). Базы 91/14 и дно 0.72 заданы хозяином вечером 18.09 от текущей
-# яркости (70/11): день +30%, дно -5%. Xiaomi — пресет User1 (50/47/44,
-# слегка тёплый), глубже гейны правятся только OSD (DDC лочит).
-NIGHT_DISPLAYS="${NIGHT_DISPLAYS:-Mi monitor:14;MAG 274QF X24:91}"
+# 14). Базы 91/14 заданы хозяином вечером 18.09 от яркости (70/11):
+# день +30%. Минимальный фактор 0.5832 — исходный 0.72 × 0.9 × 0.9.
+# Xiaomi — пресет User1 (50/47/44, слегка тёплый); гейны — только OSD.
+# An explicitly empty list disables physical DDC control (e.g. virtual outputs).
+NIGHT_DISPLAYS="${NIGHT_DISPLAYS-Mi monitor:14;MAG 274QF X24:91:40}"
 # Путь к LED-синку: по умолчанию сосед по каталогу — оба скрипта живут
 # вместе, и переезд каталога не должен рвать связь.
 NIGHT_RGB_SYNC="${NIGHT_RGB_SYNC:-$(dirname "$0")/noctalia-openrgb-sync.sh}"
@@ -145,11 +147,40 @@ emit() {
     }'
 }
 
+# Отдельный ночной минимум использует то же расписание и прогресс кривой,
+# но не меняет дневную базу или затемнение остальных потребителей.
+display_target() {
+    local base=$1 minimum=$2 factor=$3
+    awk -v b="$base" -v n="$minimum" -v f="$factor" \
+        -v m="$NIGHT_MIN_FACTOR" 'BEGIN{
+        m = sprintf("%.0f", m * 1000) / 1000
+        if (n == "") target = b * f
+        else if (f >= 1) target = b
+        else target = n + (b - n) * (f - m) / (1 - m)
+        printf "%.0f", target
+    }'
+}
+
+# RGB follows the monitor ramp's progress, but reaches its own 5% minimum.
+rgb_target() {
+    awk -v f="$1" -v m="$NIGHT_MIN_FACTOR" -v s="$NIGHT_RGB_STEP" 'BEGIN{
+        m = sprintf("%.0f", m * 1000) / 1000
+        if (f >= 1) target = 1
+        else if (f <= m) target = 0.05
+        else target = 0.05 + 0.95 * (f - m) / (1 - m)
+        target = int(target / s + 0.0001) * s
+        if (target < 0.05) target = 0.05
+        if (f >= 1) target = 1
+        printf "%.3f", target
+    }'
+}
+
 # --- Режим print --------------------------------------------------------------
 if [[ ${1:-} == print ]]; then
     now_min=$(to_min "${2:-$(date +%H:%M)}")
     readarray -t res < <(curve "$now_min")
     echo "factor: ${res[0]}"
+    echo "rgb-factor: $(rgb_target "${res[0]}")"
     if [[ ${res[1]} == identity ]]; then
         echo "temp: identity"
     else
@@ -157,15 +188,56 @@ if [[ ${1:-} == print ]]; then
     fi
     IFS=';' read -ra displays <<<"$NIGHT_DISPLAYS"
     for pair in "${displays[@]}"; do
-        spec=${pair%:*}
-        base=${pair##*:}
-        target=$(awk -v b="$base" -v f="${res[0]}" 'BEGIN{ printf "%.0f", b*f }')
+        IFS=':' read -r spec base minimum <<<"$pair"
+        target=$(display_target "$base" "$minimum" "${res[0]}")
         echo "display: $spec -> $target"
     done
     exit 0
 fi
 
 # --- Применение (один проход) --------------------------------------------------
+case "${1:-apply}" in
+    apply|restore) ;;
+    *) printf 'usage: night-mode.sh [apply|restore|print [HH:MM]]\n' >&2; exit 2 ;;
+esac
+
+mkdir -p "$(dirname "$STATE_FILE")"
+exec 9>"${STATE_FILE}.lock"
+flock -w 10 9 || { printf 'night-mode: another pass is still running\n' >&2; exit 75; }
+restore_pending="${STATE_FILE}.restore"
+[[ ${1:-} != restore ]] || touch "$restore_pending"
+restore=false
+if [[ -e $restore_pending ]]; then
+    restore=true
+    # A failed restore must also invalidate the next timer tick, not just this pass.
+    sed -i '/^DISPLAY:/d;/^FACTOR=/d' "$STATE_FILE" 2>/dev/null || [[ ! -e $STATE_FILE ]]
+fi
+
+desktops=":${XDG_CURRENT_DESKTOP:-}:"
+if [[ $desktops == *":Hyprland:"* ]]; then
+    ready=false
+    attempts=1
+    [[ $restore != true ]] || attempts=10
+    for (( attempt=0; attempt<attempts; attempt++ )); do
+        if outputs=$(timeout 0.3 hyprctl -j monitors 2>/dev/null) &&
+                jq -e --argjson awake "$restore" \
+                    'length > 0 and all(.[]; .disabled == false and .width > 0 and .height > 0 and (if $awake then .dpmsStatus == true else true end))' \
+                    <<<"$outputs" >/dev/null; then
+            ready=true
+            break
+        fi
+        [[ $restore != true ]] || sleep 0.2
+    done
+    if [[ $ready != true ]]; then
+        printf 'night-mode: session outputs are not ready; pending restore retained\n' >&2
+        exit 75
+    fi
+elif [[ $desktops != *":ShojiWM:"* ]]; then
+    printf 'night-mode: graphical session is not ready (XDG_CURRENT_DESKTOP=%s)\n' "${XDG_CURRENT_DESKTOP:-<empty>}" >&2
+    exit 75
+fi
+result=0
+
 now_min=$(to_min "$(date +%H:%M)")
 readarray -t res < <(curve "$now_min")
 # Пустой вывод curve = сломанный конфиг времён (to_min уже кричал в stderr).
@@ -174,11 +246,7 @@ readarray -t res < <(curve "$now_min")
 factor=${res[0]}
 temp_target=${res[1]}
 
-# Квантование фактора для LED: шаг нужен, чтобы файл-фактор и вызов синка
-# менялись редко и предсказуемо, а не на каждом тике из-за шума округления.
-rgb_factor=$(awk -v f="$factor" -v s="$NIGHT_RGB_STEP" 'BEGIN{
-    printf "%.3f", int(f / s + 0.0001) * s + 0
-}')
+rgb_factor=$(rgb_target "$factor")
 # Квантование температуры до NIGHT_TEMP_STEP, кроме дня (день = identity).
 if [[ $temp_target == identity ]]; then
     temp_action="identity"
@@ -202,49 +270,6 @@ last_applied() {
 
 mkdir -p "$(dirname "$STATE_FILE")"
 touch "$STATE_FILE"
-
-# --- a) LED: файл-фактор + вызов синка ----------------------------------------
-if [[ $(last_applied FACTOR || true) != "$rgb_factor" ]]; then
-    mkdir -p "$(dirname "$FACTOR_FILE")"
-    printf '%.3f\n' "$rgb_factor" >"$FACTOR_FILE"
-    if "$NIGHT_RGB_SYNC"; then
-        sed -i '/^FACTOR=/d' "$STATE_FILE"
-        echo "FACTOR=$rgb_factor" >>"$STATE_FILE"
-    else
-        # Синк упал — факт применения не фиксируем: следующий тик повторит.
-        printf 'night-mode: RGB sync failed\n' >&2
-    fi
-fi
-
-# --- b) Мониторы ---------------------------------------------------------------
-IFS=';' read -ra displays <<<"$NIGHT_DISPLAYS"
-for pair in "${displays[@]}"; do
-    spec=${pair%:*}
-    base=${pair##*:}
-    target=$(awk -v b="$base" -v f="$factor" 'BEGIN{ printf "%.0f", b*f }')
-    key="DISPLAY:${spec}"
-    failkey="DDCFAIL:${spec}"
-    if [[ $(last_applied "$key" || true) != "$target" ]]; then
-        # Модель монитора содержит пробелы — передаём как один аргумент,
-        # чтобы она не разрывалась на слова.
-        #
-        # Ошибку ddcutil (трейс стека на ~80 строк: EIO на i2c-шине и т.п.)
-        # в журнал даём только при ПЕРВОЙ неудаче для этого целевого
-        # значения: тик повторяет setvcp каждую минуту, и без затейки каждый
-        # повтор плескал бы трейс заново — файлы журнала ротировались за
-        # часы (инцидент 19.09: 4083 строки ddcutil на 25 минут архива).
-        # Успех или смена цели затейку снимает: новая серия сбоев снова
-        # станет заметной. Ретраи при этом не меняются — только тишина.
-        if err=$(ddcutil --model "$spec" setvcp 10 "$target" 2>&1); then
-            sed -i "/^${key}=/d;/^${failkey}=/d" "$STATE_FILE"
-            echo "${key}=${target}" >>"$STATE_FILE"
-        elif [[ $(last_applied "$failkey" || true) != "$target" ]]; then
-            printf 'night-mode: ddcutil failed for %s (target %s):\n%s\n' \
-                "$spec" "$target" "$err" >&2
-            echo "${failkey}=$target" >>"$STATE_FILE"
-        fi
-    fi
-done
 
 # --- c) Температура -------------------------------------------------------------
 # Температура применяется КАЖДЫЙ тик безусловно, в отличие от ddcutil и LED:
@@ -276,7 +301,7 @@ if [[ $desktops == *":ShojiWM:"* ]]; then
     fi
     # Успех — только по коду выхода; вывод (включая явный deferred) —
     # диагностика, а не признак применения.
-    if temp_error=$(/usr/bin/python3 "$NATIVE_PY" "${temp_args[@]}" 2>&1); then
+    if temp_error=$(timeout 5 /usr/bin/python3 "$NATIVE_PY" "${temp_args[@]}" 2>&1); then
         temp_ok=true
     elif [[ -z $temp_error ]]; then
         temp_error="native CLI завершился с ненулевым кодом без вывода"
@@ -286,13 +311,13 @@ elif [[ $desktops == *":Hyprland:"* ]] && command -v hyprctl >/dev/null 2>&1; th
     # Успех — только по коду выхода hyprctl; exit 0 с warning в stderr
     # провалом не считается, но текст печатаем как диагностику.
     if [[ $temp_action == identity ]]; then
-        if temp_error=$(hyprctl hyprsunset identity 2>&1 >/dev/null); then
+        if temp_error=$(timeout 5 hyprctl hyprsunset identity 2>&1 >/dev/null); then
             temp_ok=true
         else
             temp_error="hyprctl hyprsunset identity: $temp_error"
         fi
     else
-        if temp_error=$(hyprctl hyprsunset temperature "$temp_action" 2>&1 >/dev/null); then
+        if temp_error=$(timeout 5 hyprctl hyprsunset temperature "$temp_action" 2>&1 >/dev/null); then
             temp_ok=true
         else
             temp_error="hyprctl hyprsunset temperature $temp_action: $temp_error"
@@ -309,17 +334,81 @@ if [[ $temp_ok == true ]]; then
     sed -i '/^TEMPFAIL=/d' "$STATE_FILE"
     [[ -z $temp_error ]] || printf 'night-mode: temperature diagnostic:\n%s\n' \
         "$temp_error" >&2
-    exit 0
+else
+    result=1
+    temp_series="${temp_backend}:${WAYLAND_DISPLAY:-}:${temp_action}"
+    if [[ $(last_applied TEMPFAIL || true) != "$temp_series" ]]; then
+        printf 'night-mode: temperature failed (%s):\n%s\n' \
+            "$temp_series" "$temp_error" >&2
+        sed -i '/^TEMPFAIL=/d' "$STATE_FILE"
+        echo "TEMPFAIL=$temp_series" >>"$STATE_FILE"
+    fi
+fi
+# --- a) LED: файл-фактор + вызов синка ----------------------------------------
+if [[ $(last_applied FACTOR || true) != "$rgb_factor" ]]; then
+    mkdir -p "$(dirname "$FACTOR_FILE")"
+    printf '%.3f\n' "$rgb_factor" >"$FACTOR_FILE"
+    if "$NIGHT_RGB_SYNC"; then
+        sed -i '/^FACTOR=/d' "$STATE_FILE"
+        echo "FACTOR=$rgb_factor" >>"$STATE_FILE"
+    else
+        # Синк упал — факт применения не фиксируем: следующий тик повторит.
+        printf 'night-mode: RGB sync failed\n' >&2
+        result=1
+    fi
 fi
 
-temp_series="${temp_backend}:${WAYLAND_DISPLAY:-}:${temp_action}"
-if [[ $(last_applied TEMPFAIL || true) != "$temp_series" ]]; then
-    printf 'night-mode: temperature failed (%s):\n%s\n' \
-        "$temp_series" "$temp_error" >&2
-    # Сначала снимаем старый ключ: last_applied читает первую строку, и без
-    # удаления при смене цели старая серия осталась бы первой — новая серия
-    # каждый тик считалась бы новой и заливала бы журнал.
-    sed -i '/^TEMPFAIL=/d' "$STATE_FILE"
-    echo "TEMPFAIL=$temp_series" >>"$STATE_FILE"
+# --- b) Мониторы ---------------------------------------------------------------
+IFS=';' read -ra displays <<<"$NIGHT_DISPLAYS"
+for pair in "${displays[@]}"; do
+    IFS=':' read -r spec base minimum <<<"$pair"
+    target=$(display_target "$base" "$minimum" "$factor")
+    key="DISPLAY:${spec}"
+    failkey="DDCFAIL:${spec}"
+    if [[ $(last_applied "$key" || true) != "$target" ]]; then
+        # Модель монитора содержит пробелы — передаём как один аргумент,
+        # чтобы она не разрывалась на слова.
+        #
+        # Ошибку ddcutil (трейс стека на ~80 строк: EIO на i2c-шине и т.п.)
+        # в журнал даём только при ПЕРВОЙ неудаче для этого целевого
+        # значения: тик повторяет setvcp каждую минуту, и без затейки каждый
+        # повтор плескал бы трейс заново — файлы журнала ротировались за
+        # часы (инцидент 19.09: 4083 строки ddcutil на 25 минут архива).
+        # Успех или смена цели затейку снимает: новая серия сбоев снова
+        # станет заметной. Ретраи при этом не меняются — только тишина.
+        applied=false
+        if err=$(timeout 10 ddcutil --model "$spec" setvcp 10 "$target" 2>&1); then
+            applied=true
+            if [[ $restore == true ]]; then
+                if current=$(timeout 10 ddcutil --model "$spec" --brief getvcp 10 2>&1); then
+                    value=$(awk '$1 == "VCP" && $2 == "10" && $3 == "C" { print $4 }' <<<"$current")
+                    if [[ $value != "$target" ]]; then
+                        applied=false
+                        err="brightness readback mismatch: expected $target, got $current"
+                    fi
+                else
+                    applied=false
+                    err="brightness readback failed: $current"
+                fi
+            fi
+        fi
+        if [[ $applied == true ]]; then
+            sed -i "/^${key}=/d;/^${failkey}=/d" "$STATE_FILE"
+            echo "${key}=${target}" >>"$STATE_FILE"
+        else
+            result=1
+            if [[ $(last_applied "$failkey" || true) != "$target" ]]; then
+                printf 'night-mode: ddcutil failed for %s (target %s):\n%s\n' \
+                    "$spec" "$target" "$err" >&2
+                sed -i "/^${failkey}=/d" "$STATE_FILE"
+                echo "${failkey}=$target" >>"$STATE_FILE"
+            fi
+        fi
+    fi
+done
+
+
+if [[ $result == 0 ]]; then
+    rm -f "$restore_pending"
 fi
-exit 1
+exit "$result"
