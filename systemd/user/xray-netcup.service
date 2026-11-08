@@ -1,0 +1,14 @@
+[Unit]
+Description=Xray client - netcup egress for OMP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/q/.local/bin/xray run -c /home/q/.secrets/netcup-vpn/client-agents.json
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

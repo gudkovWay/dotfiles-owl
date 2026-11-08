@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily off-VM BidloBot snapshot pull
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

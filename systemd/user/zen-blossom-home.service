@@ -1,0 +1,38 @@
+[Unit]
+Description=Zen Blossom Home new-tab service (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/zen-blossom/home/server.py --profile "%h/.config/zen/92ohqv5u.Default (release)"
+WorkingDirectory=%h/.local/share/zen-blossom/home
+Restart=on-failure
+RestartSec=3
+
+# Resource bounds
+MemoryMax=128M
+MemorySwapMax=0
+
+# Sandboxing: no privilege escalation, only loopback-capable socket families,
+# read-only view of the filesystem/home (code is installed and profile only read).
+NoNewPrivileges=true
+PrivateUsers=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=%h/.config/zen
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=default.target

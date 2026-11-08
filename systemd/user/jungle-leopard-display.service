@@ -1,0 +1,23 @@
+[Unit]
+Description=Jungle Leopard AIO and case LCD images
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=6
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/jungle-leopard-display run all
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+UMask=0077
+MemoryHigh=256M
+MemoryMax=512M
+TasksMax=64
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

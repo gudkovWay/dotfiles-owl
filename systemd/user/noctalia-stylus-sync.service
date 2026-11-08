@@ -1,0 +1,15 @@
+[Unit]
+Description=Loopback-only Noctalia stylesheet for Stylus
+
+[Service]
+ExecStart=/usr/bin/python3 "/home/q/.config/noctalia/stylus-sync/serve.py" --style "/home/q/.cache/noctalia/stylus-sync/noctalia-websites.user.less" --port 8767
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET
+MemoryMax=128M
+TasksMax=16
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Pull BidloBot snapshot from netcup VPS
+
+[Service]
+Type=oneshot
+ExecStart=/home/q/.local/bin/bidlobot-offsite-pull.sh

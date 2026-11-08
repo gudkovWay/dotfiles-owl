@@ -1,9 +1,9 @@
 [Unit]
-Description=Дневник агента — раз в час и при входе
+Description=Дневник агента — ежечасно, через 3 минуты после загрузки, с догоном
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=1h
+OnCalendar=hourly
 Persistent=true
 
 [Install]

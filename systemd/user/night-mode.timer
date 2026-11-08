@@ -1,14 +1,16 @@
-# Ежеминутный тик: кривая рампы плавная, а минуты между тиками — тот квант,
-# на котором драйвер сам решает, изменилось ли что-то (и тогда не дёргает
-# железо). OnStartupSec закрывает окно после логина, когда таймер по
-# календарю ещё не тикнул, а яркость может остаться с прошлого сеанса.
+# Минутный тик и первый проход после активации графической сессии.
 [Unit]
 Description=Run night-mode ramp every minute
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Timer]
 OnCalendar=*-*-* *:*:00
 AccuracySec=1s
-OnStartupSec=15
+OnActiveSec=1
 
 [Install]
-WantedBy=timers.target
+WantedBy=graphical-session.target

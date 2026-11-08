@@ -1,0 +1,17 @@
+[Unit]
+Description=BidloBot bbolt snapshot
+Documentation=https://github.com/BYDLOKOD/bidlobot
+
+[Service]
+Type=oneshot
+# Upstream scripts/backup.sh: plain cp + atomic rename + keep-last-N
+# rotation. Its DB_PATH is the database FILE (the bot's own DB_PATH is
+# the containing directory) - do not source the bot env file here.
+Environment=DB_PATH=%h/.local/share/bidlobot/bidlobot.db
+Environment=BACKUP_DIR=%h/.local/share/bidlobot/backups
+Environment=BACKUP_KEEP=7
+# Best-effort hot copy, no stop/start dance: bbolt double-writes and
+# checksums its meta pages, so the worst case is losing the last few
+# seconds of counter writes at restore time. Upstream documents exactly
+# this tradeoff for the daily job.
+ExecStart=/home/q/dev/qol/bidlobot/scripts/backup.sh
