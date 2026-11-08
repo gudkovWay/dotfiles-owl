@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore current night settings after display wake
+Requisite=graphical-session.target
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionEnvironment=XDG_CURRENT_DESKTOP
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/hypr/scripts/night-mode.sh restore
+TimeoutStartSec=120

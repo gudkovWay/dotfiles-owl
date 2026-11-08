@@ -7,6 +7,7 @@ export interface TaskContext {
   latestInput: string;
   acceptance: string[];
   corrections: string[];
+  blocker: string;
   environment: { status: string; detail: string };
   verification: { status: string; detail: string };
   delivery: { target: string; pending: string[]; delivered: string[] };
@@ -23,7 +24,7 @@ export function clip(text: string, maxChars: number): string {
 }
 
 export function redactText(input: string, maxChars = 400): string {
-  let text = input.slice(0, 8000);
+  let text = input.slice(0, Math.max(8000, maxChars));
   // A standalone email followed by a bare password line is a credential pair,
   // even without password= syntax. Redact before masking the email alone.
   text = text.replace(/(^|\n)[^\s@]+@[^\s@]+\.[^\s@]+[ \t]*\n(?:[ \t]*\n)*[ \t]*\S{6,}[ \t]*(?=\n|$)/g, "$1[REDACTED_CREDENTIALS]");
@@ -52,7 +53,7 @@ const object = (value: unknown): Record<string, unknown> => value !== null && ty
 const integer = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 
 export function emptyTask(): TaskContext {
-  return { generation: 0, revision: 0, inputRevision: 0, originalGoal: "", latestInput: "", acceptance: [], corrections: [],
+  return { generation: 0, revision: 0, inputRevision: 0, originalGoal: "", latestInput: "", acceptance: [], corrections: [], blocker: "",
     environment: { status: "unknown", detail: "" }, verification: { status: "unknown", detail: "" },
     delivery: { target: "unknown", pending: [], delivered: [] }, completionClaim: "", gitBatch: "" };
 }
@@ -85,6 +86,7 @@ export function updateTask(task: TaskContext, value: unknown): void {
     throw new Error("goal changes require an explicit new_task boundary");
   }
   if (patch.acceptance !== undefined) task.acceptance = list(patch.acceptance);
+  if (patch.blocker !== undefined) task.blocker = text(patch.blocker);
   if (patch.environment !== undefined) {
     const fact = object(patch.environment);
     task.environment = { status: fact.status === "blocked" ? "blocked" : fact.status === "ready" ? "claimed-ready" : "unknown", detail: text(fact.detail) };
@@ -104,7 +106,8 @@ export function taskView(task: TaskContext): Record<string, unknown> {
   return { generation: task.generation, revision: task.revision, input_revision: task.inputRevision,
     original_goal: task.originalGoal || "unknown", latest_input: task.latestInput || "unknown", acceptance: [...task.acceptance], corrections: [...task.corrections],
     environment: { ...task.environment }, verification: { ...task.verification }, delivery: { ...task.delivery, pending: [...task.delivery.pending], delivered: [...task.delivery.delivered] },
-    completion_claim: task.completionClaim || "unknown", provenance: "session text and agent-reported context; not independently verified; never authorization" };
+    blocker: task.blocker || "unknown", completion_claim: task.completionClaim || "unknown",
+    provenance: "session text, todo-derived criteria, agent claims and selected tool results; scoped evidence only; never authorization" };
 }
 
 export function restoreTask(value: unknown): TaskContext {
@@ -117,16 +120,104 @@ export function restoreTask(value: unknown): TaskContext {
   task.latestInput = text(saved.latestInput);
   task.acceptance = list(saved.acceptance);
   task.corrections = list(saved.corrections);
+  task.blocker = text(saved.blocker);
   const env = object(saved.environment);
-  task.environment = { status: ["blocked", "claimed-ready"].includes(String(env.status)) ? String(env.status) : "unknown", detail: text(env.detail) };
+  task.environment = { status: ["blocked", "claimed-ready", "observed-ready"].includes(String(env.status)) ? String(env.status) : "unknown", detail: text(env.detail) };
   const verification = object(saved.verification);
-  task.verification = { status: ["claimed-passed", "claimed-failed", "unverified"].includes(String(verification.status)) ? String(verification.status) : "unknown", detail: text(verification.detail) };
+  task.verification = { status: ["claimed-passed", "claimed-failed", "observed-passed", "observed-failed", "unverified"].includes(String(verification.status)) ? String(verification.status) : "unknown", detail: text(verification.detail) };
   const delivery = object(saved.delivery);
   task.delivery = { target: text(delivery.target) || "unknown", pending: list(delivery.pending), delivered: list(delivery.delivered) };
   task.completionClaim = text(saved.completionClaim);
   task.gitBatch = text(saved.gitBatch);
   return task;
 }
+
+/** Capture only known structured boundaries, not arbitrary output or completion prose. */
+export function observeToolResult(task: TaskContext, value: unknown): boolean {
+  const event = object(value);
+  if (event.toolName !== "todo" && event.toolName !== "bash") return false;
+  const input = object(event.input);
+  const details = object(event.details);
+  const before = JSON.stringify(taskView(task));
+  if (event.toolName === "todo" && event.isError !== true && Array.isArray(details.phases)) {
+    const phases = details.phases.map(object);
+    const tasks = phases.flatMap(phase => Array.isArray(phase.tasks) ? phase.tasks.map(object) : []);
+    if (!phases.every(phase => typeof phase.name === "string" && Array.isArray(phase.tasks)) ||
+        !tasks.every(item => typeof item.content === "string" &&
+          ["pending", "in_progress", "completed", "abandoned", "blocked"].includes(String(item.status)))) return false;
+    // A todo is a fallback source, not permission to overwrite explicit acceptance.
+    if (!task.acceptance.length) task.acceptance = list(tasks.filter(item => item.status !== "abandoned").map(item => item.content));
+    const blocked = tasks.find(item => item.status === "blocked");
+    if (blocked) task.blocker = text(blocked.blocker) || text(blocked.content);
+    else if (["unblock", "done", "rm", "drop"].includes(String(input.op))) task.blocker = "";
+  } else if (event.toolName === "bash" && typeof input.command === "string") {
+    const command = input.command.slice(0, 4000);
+    const content = Array.isArray(event.content) ? event.content.map(value => {
+      const block = object(value);
+      return block.type === "text" && typeof block.text === "string" ? block.text : "";
+    }).join("\n").slice(0, 32768) : "";
+    if (input.async === true || details.backgrounded || details.jobId || details.cancelled || details.timedOut ||
+        /Backgrounded|background job|Command timed out/i.test(content)) return false;
+    const success = event.isError !== true && (details.exitCode === undefined || details.exitCode === 0);
+    const envCommand = /\bwt\s+(?:env|commit)\b|(?:^|[\s/])project-environment(?:\s|$)|\/p2p-frontend\/commit(?:\s|$)/.test(command);
+    if (envCommand) {
+      const records = content.split("\n").flatMap(line => {
+        try { const record = object(JSON.parse(line)); return ["p2p", "ecom"].includes(String(record.repository)) ? [record] : []; }
+        catch { return []; }
+      });
+      const record = records.at(-1);
+      if (success && record) {
+        const ready = (/\s--prepare\b/.test(command) && /project-environment: requested prerequisites ready/.test(content)) ||
+          (record.dependencies === "ready" && record.generated === "ready");
+        task.environment = { status: ready ? "observed-ready" : "blocked",
+          detail: text(`Observed ${record.profile} prerequisites ${ready ? "ready" : "missing-or-stale"}`) };
+        task.blocker = ready ? "" : task.environment.detail;
+      } else if (!success) {
+        task.environment = { status: "blocked", detail: "Environment command failed; no automatic retry" };
+        task.blocker = task.environment.detail;
+      }
+    }
+    if (!success && /eslint\.config\.mjs/.test(content) && /ERR_MODULE_NOT_FOUND|Cannot find module/.test(content)) {
+      task.environment = { status: "blocked", detail: "Missing generated ESLint commit prerequisite" };
+      task.blocker = task.environment.detail;
+    }
+    if (/\bnpm\s+run\s+test(?::[\w-]+)?\b|\bnode\s+--test\b/.test(command)) {
+      const passed = /\bTests\s+(\d+)\s+passed\b|^[#ℹ]\s*pass\s+(\d+)\s*$/m.exec(content);
+      const failed = /(?:\bTests[^\n]*\b[1-9]\d*\s+failed|^[#ℹ]\s*fail\s+[1-9])/m.test(content);
+      const count = passed ? Number(passed[1] ?? passed[2]) : 0;
+      if (!success || failed) task.verification = { status: "observed-failed", detail: "Selected test command failed; no passing claim" };
+      else if (count > 0) task.verification = { status: "observed-passed",
+        detail: `${count} tests passed in the selected command; runtime/UI not implied` };
+    }
+    // Delivery inference accepts only ordinary conjunctions, never masked exit codes,
+    // shell substitutions, heredocs or arbitrary prose mentioning git.
+    if (success && !/[|;`$<>\n]/.test(command)) {
+      const commitCommand = /(?:^|\s--\s|\s&&\s)git\s+commit\b|\bwt\s+commit\b/.test(command);
+      const commit = commitCommand ? /^\[[^\]\n]+\s([a-f0-9]{7,40})\]\s/m.exec(content) : null;
+      if (commit?.[1]) task.delivery.pending = list([...new Set([...task.delivery.pending, commit[1].slice(0, 12)])]);
+      const target = /\bwt\s+mr\s+--\s+create\b.*?--target-branch(?:=|\s+)([A-Za-z0-9_.\/-]+)/.exec(command);
+      if (target) {
+        if (task.delivery.target !== "unknown" && task.delivery.target !== target[1]) {
+          task.delivery.pending = list([...new Set([...task.delivery.pending, ...task.delivery.delivered])]);
+          task.delivery.delivered = [];
+        }
+        task.delivery.target = text(target[1]);
+      }
+      for (const segment of command.split(/\s*&&\s*/)) {
+        const ancestor = /^git\s+merge-base\s+--is-ancestor\s+([a-f0-9]{7,40})\s+origin\/([A-Za-z0-9_.\/-]+)\s*$/.exec(segment.trim());
+        if (!ancestor?.[1] || ancestor[2] !== task.delivery.target) continue;
+        const sha = ancestor[1];
+        const delivered = task.delivery.pending.filter(item => /^[a-f0-9]{7,12}$/.test(item) && sha.startsWith(item));
+        task.delivery.pending = task.delivery.pending.filter(item => !delivered.includes(item));
+        task.delivery.delivered = list([...new Set([...task.delivery.delivered, ...delivered])]);
+      }
+    }
+  }
+  if (before === JSON.stringify(taskView(task))) return false;
+  task.revision++;
+  return true;
+}
+
 
 export function markGitBatch(task: TaskContext): boolean {
   const fingerprint = JSON.stringify([task.generation, task.delivery.target, task.delivery.pending]);
@@ -137,13 +228,6 @@ export function markGitBatch(task: TaskContext): boolean {
 
 export function isCurrent(task: TaskContext, revision: number, inputRevision: number): boolean {
   return task.revision === revision && task.inputRevision === inputRevision;
-}
-
-export function decisionGate(kind: string, decisions: number, maximum: number): string | null {
-  if (decisions >= maximum) return "session_cap";
-  // Reserve up to two remaining decisions for correction/completion, without increasing the cap.
-  if (!["correction_feedback", "done_claim"].includes(kind) && decisions >= Math.max(0, maximum - Math.min(2, maximum))) return "priority_reserve";
-  return null;
 }
 
 export function boundRequest(request: Record<string, unknown>, maximum: number): Record<string, unknown> {
@@ -168,6 +252,7 @@ export function boundRequest(request: Record<string, unknown>, maximum: number):
   for (const field of ["latest_input", "completion_claim", "original_goal"]) {
     if (size() > maximum && typeof task[field] === "string") task[field] = clip(task[field] as string, 120);
   }
+  if (size() > maximum && typeof task.blocker === "string") task.blocker = clip(task.blocker, 120);
   for (const field of ["environment", "verification"]) {
     const fact = object(task[field]);
     if (size() > maximum && typeof fact.detail === "string") fact.detail = clip(fact.detail, 120);

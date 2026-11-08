@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenRGB SDK server (owns the LED hardware)
+Documentation=man:openrgb(1)
+# The palette sync talks to this server instead of the hardware, so it must not
+# depend on the OpenRGB GUI being open: since OpenRGB 1.0 the GUI autoconnects
+# to a running local server and does no detection of its own, so closing the
+# tray window no longer takes the SDK socket down with it.
+Wants=noctalia-openrgb-sync.service
+Before=noctalia-openrgb-sync.service
+After=graphical-session.target
+
+[Service]
+Type=simple
+# No --profile on purpose: the ARGB header LED counts already come back from
+# OpenRGB's own Configuration.json at detection, and a profile load would race
+# the sync below - the socket accepts connections about a second before the
+# profile is applied, so a profile colour could land on top of the palette one.
+# The palette sync is the single writer of modes and colours.
+ExecStart=/usr/bin/openrgb --server
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

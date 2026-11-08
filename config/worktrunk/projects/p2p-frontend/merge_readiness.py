@@ -9,6 +9,13 @@ import time
 from urllib.parse import quote
 
 ACTIVE = {'created', 'waiting_for_resource', 'preparing', 'pending', 'running', 'scheduled'}
+TYPECHECK_APPS = {
+    'Typecheck · Admin': 'payscrow-admin',
+    'Typecheck · Form': 'payscrow-form',
+    'Typecheck · Exchange Form': 'exchange-form',
+    'Typecheck · Merchant': 'payscrow-merchant',
+    'Typecheck · Provider': 'payscrow-provider',
+}
 
 
 class Forge:
@@ -49,7 +56,7 @@ def required_jobs(ci, paths):
     selected = set()
     found = 0
     for block in blocks:
-        match = re.match(r'((?:Tests|Typecheck) · [A-Za-z]+):\s*\n', block)
+        match = re.match(r'((?:Tests|Typecheck) · [A-Za-z]+(?: [A-Za-z]+)*):\s*\n', block)
         if not match:
             continue
         name = match[1]
@@ -60,8 +67,10 @@ def required_jobs(ci, paths):
         patterns = re.findall(r'^        - (\S+)\s*$', selector[1], re.M)
         if not patterns or any(char in ''.join(patterns) for char in '{}![]'):
             raise RuntimeError('unsupported native CI changes patterns for ' + name)
-        if name.startswith('Typecheck') and not re.search(r'./scripts/typecheck-app.sh payscrow-[a-z]+ 0\s*$', block, re.M):
-            raise RuntimeError('native CI typecheck entrypoint/zero threshold changed: ' + name)
+        if name.startswith('Typecheck'):
+            app = TYPECHECK_APPS.get(name)
+            if app is None or not re.search(r'./scripts/typecheck-app.sh ' + re.escape(app) + r' 0\s*$', block, re.M):
+                raise RuntimeError('native CI typecheck entrypoint/zero threshold changed: ' + name)
         if any(fnmatch.fnmatchcase(path, pattern.replace('/**/*', '/*'))
                for path in paths for pattern in patterns):
             selected.add(name)
@@ -81,16 +90,17 @@ def check_pipeline(pipeline, jobs, sha, required):
             raise RuntimeError('missing/unsuccessful mandatory CI job: ' + name)
 
 
-def validate_mr(mr, branch, sha):
+def validate_mr(mr, branch, sha, *, require_mergeable=True):
     if (mr.get('source_branch') != branch or mr.get('sha') != sha
             or mr.get('target_branch') != 'dev' or mr.get('state') != 'opened'
             or not mr.get('source_project_id')
             or mr.get('source_project_id') != mr.get('target_project_id')):
         raise RuntimeError('MR source/target/project/SHA no longer matches the approved p2p feature')
-    if mr.get('draft') or mr.get('work_in_progress') or mr.get('has_conflicts'):
-        raise RuntimeError('draft or conflicting MR is not mergeable')
-    if mr.get('blocking_discussions_resolved') is False:
-        raise RuntimeError('MR has unresolved blocking discussions')
+    if require_mergeable:
+        if mr.get('draft') or mr.get('work_in_progress') or mr.get('has_conflicts'):
+            raise RuntimeError('draft or conflicting MR is not mergeable')
+        if mr.get('blocking_discussions_resolved') is False:
+            raise RuntimeError('MR has unresolved blocking discussions')
 
 
 def pipeline_jobs(forge, project, pipeline, sha, visited=None):
@@ -112,14 +122,14 @@ def pipeline_jobs(forge, project, pipeline, sha, visited=None):
     return jobs
 
 
-def wait_for_ci(root, iid, branch, sha, required, seconds=600):
+def wait_for_ci(root, iid, branch, sha, required, seconds=600, *, require_mergeable=True):
     forge = Forge(root)
     deadline = time.monotonic() + seconds
     while True:
         mr = forge.mr(iid)
-        validate_mr(mr, branch, sha)
+        validate_mr(mr, branch, sha, require_mergeable=require_mergeable)
         pipelines = forge.pages(f'projects/:id/merge_requests/{iid}/pipelines')
-        matching = [row for row in pipelines if row.get('sha') == sha]
+        matching = [row for row in pipelines if row.get('sha') == sha and row.get('source') == 'merge_request_event']
         current = max(matching, key=lambda row: int(row['id'])) if matching else None
         if current and current.get('status') == 'success':
             jobs = pipeline_jobs(forge, ':id', current, sha)

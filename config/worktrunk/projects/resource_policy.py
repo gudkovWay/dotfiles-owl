@@ -19,7 +19,9 @@ def admit_tasks(state, requested):
         raise GuardError('invalid task cap; must be within parent PID budget')
     promised = sum(job.get('tasks', DEFAULT_TASKS) for job in state['jobs'].values())
     if promised + requested > PARENT_PIDS:
-        raise Busy(f'pid_budget: requested={requested}; promised={promised}; parent={PARENT_PIDS}')
+        raise Busy(f'pid_budget: requested={requested}; promised={promised}; parent={PARENT_PIDS}',
+                   reason_code='pid_budget', requested_tasks=requested,
+                   promised_tasks=promised, parent_tasks=PARENT_PIDS)
 
 
 class GuardError(RuntimeError):
@@ -28,6 +30,10 @@ class GuardError(RuntimeError):
 
 class Busy(GuardError):
     code = 75
+
+    def __init__(self, message, *, reason_code='resource_busy', **details):
+        super().__init__(message)
+        self.details = dict(reason_code=reason_code, **details)
 
 
 def round_up(value):
@@ -56,11 +62,12 @@ def admission(state, available, limit, usage=None, jitter=0):
     if type(limit) is not int or limit <= 0:
         raise GuardError('memory limit must be positive')
     if len(state['jobs']) >= MAX_JOBS:
-        raise Busy('job_slots: all local job slots occupied')
+        raise Busy('job_slots: all local job slots occupied', reason_code='job_slots')
     usage = {} if usage is None else usage
     free = free_capacity(state, available, usage, jitter)
     if limit > free:
-        raise Busy(f'ram: requested={limit}; available-for-promises={free}; host-floor={HOST_FLOOR}')
+        raise Busy(f'ram: requested={limit}; available-for-promises={free}; host-floor={HOST_FLOOR}',
+                   reason_code='ram', required_bytes=limit, free_capacity_bytes=free)
     committed = sum(max(j['limit'], j.get('pending_limit', 0)) for j in state['jobs'].values())
     # Retain existing parent caps under foreign pressure; fresh admission still
     # checks every unused promise. An old low epoch is not a permanent ceiling.
@@ -82,7 +89,9 @@ def allocate_memory(state, available, requested, usage, *, need=None, jitter=0):
         room = max(0, free - round_up(peak)) // (1 + waiting)
         buffer = min(desired, room // STEP * STEP)
         if buffer < STEP:
-            raise Busy(f'ram: expected={peak}; insufficient safe buffer; free={free}')
+            raise Busy(f'ram: expected={peak}; insufficient safe buffer; free={free}',
+                       reason_code='ram', required_bytes=round_up(peak) + STEP,
+                       free_capacity_bytes=free)
         limit = round_up(peak) + buffer
         high = round_up(peak) + buffer // 2
     return admission(state, available, limit, usage, jitter), limit, high
@@ -108,32 +117,71 @@ def jitter_margin(samples, now, available):
 
 def enqueue(state, entry):
     queue = state.setdefault('queue', [])
-    if any(e['id'] == entry['id'] for e in queue):
+    previous = next((e for e in queue if e['id'] == entry['id']), None)
+    if previous is not None:
+        if any(previous[key] != entry[key] for key in ('pid', 'start', 'goal')):
+            raise GuardError('queued job identity changed')
+        previous.update(required=entry['required'], keys=list(entry['keys']),
+                        tasks=entry.get('tasks', DEFAULT_TASKS),
+                        deadline=min(previous['deadline'], entry['deadline']))
         return
     if len(queue) >= 128:
-        raise Busy('queue_slots: pending queue is full')
+        raise Busy('queue_slots: pending queue is full', reason_code='queue_slots')
     queue.append(dict(entry))
 
 
-def queue_choice(state, capacity, blocked_keys, now):
+def queue_choice(state, capacity, blocked_keys, now, request=None):
     queue = [e for e in state.get('queue', []) if e['deadline'] > now]
-    # Keys belonging to other environments must not cause global head-of-line blocking.
-    pid_free = PARENT_PIDS - sum(job.get('tasks', DEFAULT_TASKS) for job in state['jobs'].values())
+    target = next((e for e in queue if e['id'] == request), None)
+    jobs = state['jobs']
+    promised = sum(job.get('tasks', DEFAULT_TASKS) for job in jobs.values())
+    pid_free = PARENT_PIDS - promised
+    result = dict(selected=None, reason_code='queue_empty',
+                  free_capacity_bytes=capacity,
+                  required_bytes=target['required'] if target else None,
+                  promised_tasks=promised, parent_tasks=PARENT_PIDS)
+    if len(jobs) >= MAX_JOBS:
+        return dict(result, reason_code='job_slots')
     eligible = sorted((e for e in queue if not blocked_keys.intersection(e['keys'])
                        and e.get('tasks', DEFAULT_TASKS) <= pid_free),
                       key=lambda e: (e['enqueued_at'], e['id']))
-    if not eligible:
-        return None
-    first = eligible[0]
-    if now-first['enqueued_at'] >= 60:
-        return first['id'] if first['required'] <= capacity else None
-    # Prefer another goal after the previous admission, without bypassing an
-    # aged holder. All requests retain their original timestamp and identity.
-    last = state.get('last_goal')
-    for entry in sorted(eligible, key=lambda e: (e['goal'] == last, e['enqueued_at'])):
-        if entry['required'] <= capacity:
-            return entry['id']
-    return None
+    selected, draining = None, None
+    if eligible:
+        first = eligible[0]
+        age = now - first['enqueued_at']
+        if age >= 60 and first['required'] <= capacity:
+            selected = first['id']
+        elif (60 <= age < 120 and jobs and
+              capacity < first['required'] <= capacity + sum(
+                  max(job['limit'], job.get('pending_limit', 0)) for job in jobs.values())):
+            # Drain existing promises briefly; external RAM never holds an idle queue.
+            draining = first['id']
+        else:
+            last = state.get('last_goal')
+            selected = next((e['id'] for e in sorted(
+                eligible, key=lambda e: (e['goal'] == last, e['enqueued_at'], e['id']))
+                if e['required'] <= capacity), None)
+    result['selected'] = selected
+    if request is not None and target is None:
+        return dict(result, reason_code='queue_expired')
+    if target:
+        blocked = sorted(blocked_keys.intersection(target['keys']))
+        if blocked:
+            blocker = next((name for name, job in jobs.items()
+                            if set(job['keys']).intersection(blocked)), None)
+            return dict(result, reason_code='gpu_busy' if '/gpu/host' in blocked else 'environment_busy',
+                        blocked_keys=blocked, blocking_job_id=blocker)
+        if target.get('tasks', DEFAULT_TASKS) > pid_free:
+            return dict(result, reason_code='pid_budget',
+                        requested_tasks=target.get('tasks', DEFAULT_TASKS))
+        if target['required'] > capacity:
+            return dict(result, reason_code='ram')
+    if draining:
+        return dict(result, reason_code='queue_head_drain', blocking_job_id=draining)
+    if selected:
+        return dict(result, reason_code='admitted' if request in (None, selected) else 'queue_turn',
+                    blocking_job_id=selected if request not in (None, selected) else None)
+    return dict(result, reason_code='ram' if eligible else 'queue_empty')
 
 
 def estimate_wait(state, request, capacity, now):
@@ -142,7 +190,7 @@ def estimate_wait(state, request, capacity, now):
     if target is None:
         return None
     busy_keys = {key for j in state['jobs'].values() for key in j['keys']}
-    if queue_choice(state, capacity, busy_keys, now) == request:
+    if queue_choice(state, capacity, busy_keys, now)['selected'] == request:
         return 0
     releases = []
     for job in state['jobs'].values():
@@ -160,7 +208,7 @@ def estimate_wait(state, request, capacity, now):
         capacity += job['limit']
         keys = {key for j in hypothetical['jobs'].values() for key in j['keys']}
         while True:
-            chosen = queue_choice(hypothetical, capacity, keys, now+remaining)
+            chosen = queue_choice(hypothetical, capacity, keys, now+remaining)['selected']
             if chosen is None:
                 break
             if chosen == request:

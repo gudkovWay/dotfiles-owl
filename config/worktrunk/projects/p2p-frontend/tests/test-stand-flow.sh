@@ -305,7 +305,16 @@ class StandFlow(unittest.TestCase):
         self.assertEqual(self.subject.plan()['roles'], ['admin', 'merchant'])
 
     def test_force_and_other_branch_publication_are_refused_before_git_push(self):
-        for args in (['--force', 'origin', self.branch], ['origin', 'dev']):
+        ref = 'refs/heads/' + self.branch
+        sha = git(self.tree, 'rev-parse', 'HEAD')
+        for args in (
+                ['--force', 'origin', self.branch],
+                ['--force-with-lease', 'origin', self.branch],
+                ['--force-with-lease=' + ref, 'origin', self.branch],
+                ['--force-with-lease=' + ref + ':abc', 'origin', self.branch],
+                ['--force-with-lease=' + ref + ':' + '0' * 40, 'origin', self.branch],
+                ['--force-with-lease=refs/heads/dev:' + sha, 'origin', self.branch],
+                ['origin', 'dev']):
             result = subprocess.run(['sh', str(stand.HERE / 'push'), *args],
                                     cwd=self.tree, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
@@ -343,6 +352,28 @@ class StandFlow(unittest.TestCase):
                                 cwd=self.tree, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(git(remote, 'rev-parse', 'refs/heads/' + self.branch), before)
+        self.assertFalse((self.tree / '.superpowers/stand/state.json').exists())
+
+    def test_exact_lease_rewrites_task_and_stale_lease_preserves_remote(self):
+        remote = self.root / 'remote.git'
+        git(self.repo, 'init', '--bare', '-q', str(remote))
+        git(self.repo, 'remote', 'add', 'fixture', str(remote))
+        old = git(self.tree, 'commit-tree', 'HEAD^{tree}', '-p', 'origin/dev', '-m', 'published sibling')
+        ref = 'refs/heads/' + self.branch
+        git(self.tree, 'push', 'fixture', old + ':' + ref)
+        head = git(self.tree, 'rev-parse', 'HEAD')
+        stale = git(self.tree, 'rev-parse', 'origin/dev')
+        plain = subprocess.run(['sh', str(stand.HERE / 'push'), 'fixture', self.branch],
+                               cwd=self.tree, capture_output=True, text=True)
+        self.assertNotEqual(plain.returncode, 0)
+        self.assertEqual(git(remote, 'rev-parse', ref), old)
+        for expected, succeeds in ((stale, False), (old, True)):
+            result = subprocess.run(['sh', str(stand.HERE / 'push'),
+                                     '--force-with-lease=' + ref + ':' + expected,
+                                     'fixture', self.branch],
+                                    cwd=self.tree, capture_output=True, text=True)
+            self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+            self.assertEqual(git(remote, 'rev-parse', ref), head if succeeds else old)
         self.assertFalse((self.tree / '.superpowers/stand/state.json').exists())
 
     def test_registered_batch_cannot_fall_back_to_ordinary_push(self):

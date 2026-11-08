@@ -1,0 +1,25 @@
+#!/bin/sh
+# pre-switch gate: a DEV-* branch name becomes the stand name.
+#
+# The dyn-env jobs publish `environment: name: $CI_COMMIT_REF_SLUG`, and GitLab
+# shortens that slug to 63 bytes. A longer branch deploys under a truncated
+# name that can silently collide with another branch's stand, so new names are
+# refused above the limit. Branches that already exist stay switchable.
+set -u
+limit=63
+branch=${1-}
+[ -n "$branch" ] || exit 0
+case $branch in refs/heads/*) branch=${branch#refs/heads/} ;; esac
+case $branch in DEV-*) ;; *) exit 0 ;; esac
+LC_ALL=C
+export LC_ALL
+length=${#branch}
+[ "$length" -le "$limit" ] && exit 0
+if git show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null ||
+   git show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+    exit 0
+fi
+printf 'refused: %s is %s characters; a DEV-* stand name is limited to %s (CI_COMMIT_REF_SLUG).\n' \
+    "$branch" "$length" "$limit" >&2
+printf 'refused: DEV-capitalism-slave-<topic> leaves 42 characters for <topic>, DEV-capitalism-slave-hotfix-<topic> leaves 35.\n' >&2
+exit 1

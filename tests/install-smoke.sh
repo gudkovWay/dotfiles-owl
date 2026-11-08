@@ -25,6 +25,10 @@ STUB_BIN="$TMP/bin"
 mkdir -p "$STUB_BIN"
 cat >"$STUB_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
+if [[ -n "${SYSTEMCTL_MARKER:-}" ]]; then
+  : >"$SYSTEMCTL_MARKER"
+  exit 97
+fi
 exit 0
 EOF
 chmod +x "$STUB_BIN/systemctl"
@@ -33,6 +37,30 @@ cat >"$STUB_BIN/herdr" <<'EOF'
 exit 0
 EOF
 chmod +x "$STUB_BIN/herdr"
+
+INBOX_HOME="$TMP/inbox-only"
+INBOX_DEST="$INBOX_HOME/.omp/agent/extensions/inbox"
+mkdir -p "$(dirname "$INBOX_DEST")"
+ln -s "$TMP/owner-provider" "$(dirname "$INBOX_DEST")/provider"
+env -i HOME="$INBOX_HOME" XDG_CONFIG_HOME="$INBOX_HOME/.config" \
+  PATH="$STUB_BIN:$PATH" SYSTEMCTL_MARKER="$TMP/inbox-systemctl-called" \
+  bash "$REPO/install.sh" --omp-inbox-only >/dev/null 2>&1 ||
+  fail 'inbox-only installer exited non-zero'
+[[ -L "$INBOX_DEST" && "$(readlink -f "$INBOX_DEST")" == "$REPO/omp/extensions/inbox" ]] ||
+  fail 'inbox-only installer did not install the complete extension'
+[[ ! -e "$INBOX_HOME/.config/fish" && ! -e "$TMP/inbox-systemctl-called" ]] ||
+  fail 'inbox-only installer touched unrelated config or user services'
+[[ "$(readlink "$(dirname "$INBOX_DEST")/provider")" == "$TMP/owner-provider" ]] ||
+  fail 'inbox-only installer changed another extension'
+rm "$INBOX_DEST"
+mkdir "$INBOX_DEST"
+printf 'owner extension\n' >"$INBOX_DEST/local.ts"
+env -i HOME="$INBOX_HOME" XDG_CONFIG_HOME="$INBOX_HOME/.config" \
+  PATH="$STUB_BIN:$PATH" SYSTEMCTL_MARKER="$TMP/inbox-systemctl-called" \
+  bash "$REPO/install.sh" --omp-inbox-only >/dev/null 2>&1 ||
+  fail 'inbox-only reinstall exited non-zero'
+[[ ! -L "$INBOX_DEST" && "$(cat "$INBOX_DEST/local.ts")" == 'owner extension' ]] ||
+  fail 'inbox-only installer replaced an owner extension directory'
 
 # An untracked runtime file a fish session may have created inside config/fish.
 RUNTIME_FILE="$FAKE_CONFIG/fish/fish_read_history"
@@ -119,6 +147,7 @@ for relative in \
   projects/p2p-frontend/push projects/p2p-frontend/stand projects/p2p-frontend/typecheck \
   projects/p2p-frontend/mr projects/p2p-frontend/mr-guard projects/p2p-frontend/mr-command \
   projects/p2p-frontend/feature-finalize projects/p2p-frontend/feature_finalize.py \
+  projects/p2p-frontend/finalize_agent.mjs projects/p2p-frontend/linear_editor.mjs \
   projects/p2p-frontend/merge_readiness.py projects/p2p-frontend/finalize-prompt.md; do
   destination="$FAKE_CONFIG/worktrunk/$relative"
   [[ -L "$destination" && "$(readlink -f "$destination")" == "$REPO/config/worktrunk/$relative" ]] ||

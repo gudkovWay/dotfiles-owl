@@ -13,14 +13,13 @@ import sys
 import time
 from urllib.parse import quote
 
-from merge_readiness import Forge, required_jobs, validate_mr, wait_for_ci
+from merge_readiness import Forge, TYPECHECK_APPS, required_jobs, validate_mr, wait_for_ci
 from review_contract import context_path, load_context, store_context, validate_review
 
 HERE = Path(__file__).resolve().parent
 PROJECTS = HERE.parent
 GUARD = PROJECTS / 'guarded-run'
 MODEL = 'openai-codex/gpt-6.1-sol'
-MODEL_SECONDS = 480
 MAX_INPUT = 900_000  # Never silently omit the rest of a feature diff.
 
 
@@ -57,7 +56,7 @@ def snapshot(root, allow_dirty=False):
                                           '--exclude-standard', '-z']).decode().split('\0')
     return {'branch': git(root, 'branch', '--show-current'), 'head': head,
             'tree': None if dirty else git(root, 'rev-parse', 'HEAD^{tree}'),
-            'target': target, 'merge_base': base, 'source_key': source_key(root),
+            'target': target, 'merge_base': base, 'source_key': source_key(root), 'runtime_key': runtime_key(root),
             'paths': sorted(set(filter(None, names)))}
 
 
@@ -66,11 +65,70 @@ def feature_diff(root, current):
                                     '--no-textconv', '--no-renames', current['merge_base'], current['head']])
 
 
+def documentation_only(root, current):
+    paths = current['paths']
+    if not paths or any(
+        Path(name).suffix.lower() != '.md' or not (
+            name.startswith(('docs/', '.agents/commands/', '.agents/rules/', '.agents/skills/', '.omp/commands/'))
+            or name in {'README.md', 'CHANGELOG.md', '.agents/AGENTS.md', '.agents/component-map.md'}
+        ) for name in paths
+    ):
+        return False
+    for revision in (current['merge_base'], current['head']):
+        entries = subprocess.check_output(
+            ['git', '-C', str(root), 'ls-tree', '-r', '-z', revision, '--', *paths]
+        ).split(b'\0')
+        if any(entry and entry.split(b' ', 1)[0] != b'100644' for entry in entries):
+            return False
+    return True
+
+
+def review_documentation(root, current, path):
+    key = policy_key(root)
+    run = path / (str(time.time_ns()) + '-' + current['head'][:12])
+    run.mkdir(mode=0o700)
+    inputs = feature_diff(root, current)
+    if len(inputs) > MAX_INPUT:
+        raise RuntimeError('full feature diff exceeds the reviewed input bound; never truncate')
+    (run / 'feature.diff').write_bytes(inputs)
+    save(run / 'source.json', current)
+    (run / 'review-context.json').write_bytes(context_path(root).read_bytes())
+    request = (HERE / 'review-contract.md').read_text() + (
+        '\n\nPHASE: DOCUMENTATION REVIEW ONLY. Read tools only. Review the complete prose diff '
+        'against every originating owner requirement and repository analog. Do not modify files, '
+        'run application checks, start a preview, commit or publish. Return only the review JSON '
+        'object defined above, with context_key and exact per-path coverage. Findings must be '
+        'concrete; source inspection is not runtime verification.\n')
+    (run / 'review-request.md').write_text(request)
+    run_agent(root, [run / 'review-request.md', run / 'source.json',
+                     run / 'feature.diff', run / 'review-context.json'], run / 'review.md', True)
+    if snapshot(root) != current or policy_key(root) != key:
+        raise RuntimeError('documentation review changed source/policy; no mixed-revision receipt')
+    review = validate_review(root, json.loads((run / 'review.md').read_text()),
+                             current['paths'], load_context(root))
+    if any(scope['findings'] for scope in review['coverage']):
+        raise RuntimeError('documentation review has findings; correct source before finalization: ' + str(run / 'review.md'))
+    manifest = {'tests': [], 'commits': [], 'ui': {'required': False},
+                'review': review, 'fixed': [], 'backend': [],
+                'warnings': ['Documentation-only source review; application runtime is not applicable.']}
+    save(run / 'implementation.json', manifest)
+    proof = verify_local(root, current, manifest, run)
+    proof.update(profile='documentation-only', sol={'model': MODEL, 'thinking': 'high',
+                 'service_tier': 'priority', 'review_sha256': sha256(run / 'review.md')})
+    if snapshot(root) != current or policy_key(root) != key:
+        raise RuntimeError('documentation verification inputs changed; no stale receipt')
+    (run / 'report.md').write_text(render_report(root, manifest, proof))
+    save(run / 'verification.json', proof)
+    save(path / 'receipt.json', receipt_for(current, key, run / 'verification.json'))
+    save(run / 'state.json', {'phase': 'verified', 'source': current, 'policy': key})
+    print('feature-finalize: documentation review report: ' + str(run / 'report.md'), flush=True)
+
+
 def policy_key(root):
     paths = [Path(__file__), HERE / 'merge_readiness.py', HERE / 'finalize-prompt.md',
-             HERE / 'review-contract.md', HERE / 'review_contract.py',
+             HERE / 'finalize_agent.mjs', HERE / 'review-contract.md', HERE / 'review_contract.py',
              HERE / 'typecheck', PROJECTS / 'project-environment', PROJECTS / 'ui-session',
-             root / '.claude/commands/refactor.md']
+             *sorted((root / '.agents').rglob('*.md'))]
     context = context_path(root)
     context_key = sha256(context) if context.is_file() else 'missing-owner-context'
     return hashlib.sha256((''.join(str(p) + '\0' + sha256(p) for p in paths) + context_key).encode()).hexdigest()
@@ -149,18 +207,52 @@ def refresh(root):
     subprocess.run(['git', 'fetch', 'origin', '+refs/heads/dev:refs/remotes/origin/dev'], cwd=root, check=True)
 
 
+def remote_tip(root, branch):
+    ref = 'refs/heads/' + branch
+    rows = git(root, 'ls-remote', '--heads', 'origin', ref).splitlines()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise RuntimeError('ambiguous remote source ref')
+    fields = rows[0].split()
+    if len(fields) != 2 or fields[1] != ref or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', fields[0]):
+        raise RuntimeError('invalid remote source identity')
+    return fields[0]
+
+
+def publication_plan(root, current, expected_remote_sha=None):
+    if expected_remote_sha is not None and not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', expected_remote_sha):
+        raise RuntimeError('--expected-remote-sha requires the complete observed source SHA')
+    remote = remote_tip(root, current['branch'])
+    if expected_remote_sha is not None and remote != expected_remote_sha:
+        raise RuntimeError('remote tip changed; inspect new commits instead of replacing the lease')
+    if remote is None:
+        return {'remote_sha': None, 'options': []}
+    subprocess.run(['git', 'fetch', 'origin', 'refs/heads/' + current['branch']], cwd=root, check=True)
+    if git(root, 'rev-parse', 'FETCH_HEAD') != remote:
+        raise RuntimeError('remote tip changed during fetch; inspect before publication')
+    ancestry = subprocess.run(['git', '-C', str(root), 'merge-base', '--is-ancestor', remote, current['head']])
+    if ancestry.returncode not in (0, 1):
+        ancestry.check_returncode()
+    if ancestry.returncode == 0:
+        return {'remote_sha': remote, 'options': []}
+    if expected_remote_sha is None:
+        raise RuntimeError('published history diverged; authorized rebase requires --expected-remote-sha')
+    return {'remote_sha': remote, 'options': [
+        '--force-with-lease=refs/heads/' + current['branch'] + ':' + remote]}
+
+
 def agent_command(root, inputs, plan):
-    tools = 'read,glob,grep' if plan else 'read,glob,grep,edit,write,bash,todo,eval'
-    return ['omp', '--print', '--mode=json', '--model=' + MODEL, '--thinking=high', '--service-tier=priority', '--no-prewalk',
-            '--no-extensions', '--no-title', '--no-lsp', '--auto-approve', '--max-time=' + str(MODEL_SECONDS),
-            '--cwd=' + str(root), '--tools=' + tools, *('@' + str(path) for path in inputs)]
+    output = inputs[0].parent / ('plan' if plan else 'source') if inputs else root / '.superpowers/finalize/inspection'
+    return ['bun', str(HERE / 'finalize_agent.mjs'), str(root), 'plan' if plan else 'source',
+            str(output), *(str(path) for path in inputs)]
 
 
 def run_agent(root, inputs, output, plan):
     phase = 'plan' if plan else 'refactor'
     print(f'feature-finalize: Sol {phase} starting (high, priority); log: {output}', flush=True)
     command = [str(GUARD), '--need', '2G' if plan else '6G',
-               '--tasks', '256', '--wait', '60',
+               '--tasks', '256', '--wait', '60', '--runtime', '0',
                '--exclusive-key', str(root), '--', *agent_command(root, inputs, plan)]
     events = output.with_suffix('.events.jsonl')
     with events.open('w') as log:
@@ -202,12 +294,22 @@ def changed_paths(root):
 
 
 def source_key(root):
+    return content_key(root)
+
+
+def runtime_key(root):
+    return content_key(root, runtime=True)
+
+
+def content_key(root, runtime=False):
     """Content identity remains stable when the same bytes are committed."""
     names = subprocess.check_output(['git', '-C', str(root), 'ls-files', '-z',
                                      '--cached', '--others', '--exclude-standard']).decode().split('\0')
     names += [str(path.relative_to(root)) for path in root.glob('apps/*/.env')]
     digest = hashlib.sha256()
     for name in sorted(set(filter(None, names))):
+        if runtime and re.fullmatch(r'lib/(?:common|admin|form|merchant|provider)-layer/.*\.(?:test|spec)\.tsx?', name):
+            continue
         path = root / name
         if not path.exists() and not path.is_symlink():
             continue
@@ -256,10 +358,15 @@ def test_commands(root, selections):
             if path.is_absolute() or '..' in path.parts or not name.startswith('lib/' + layer + '-layer/') or not name.endswith(('.test.ts', '.spec.ts', '.test.tsx', '.spec.tsx')) or not (root / path).is_file() or (root / path).is_symlink():
                 raise RuntimeError('test path is not an existing native test for the selected layer: ' + name)
             resolved.append(str(root / path))
-        variants = ['form:classic', 'form:exchange'] if layer == 'form' else [layer]
-        for variant in variants:
-            result.append((layer, ['npm', 'run', 'test:' + variant, '--', *resolved,
-                                  '--maxWorkers=1', '--no-file-parallelism', '--maxConcurrency=1', '--retry=0']))
+        variants = ({'form:classic': [], 'form:exchange': []} if layer == 'form' else {layer: []})
+        for name, resolved_path in zip(files, resolved):
+            variant = ('form:exchange' if name.startswith('lib/form-layer/ui/exchange/')
+                       else 'form:classic') if layer == 'form' else layer
+            variants[variant].append(resolved_path)
+        for variant, selected_files in variants.items():
+            if selected_files:
+                result.append((layer, ['npm', 'run', 'test:' + variant, '--', *selected_files,
+                                      '--maxWorkers=1', '--no-file-parallelism', '--maxConcurrency=1', '--retry=0']))
     return result
 
 
@@ -336,20 +443,10 @@ def ci_requirements(root, current):
     return required_jobs(source, current['paths']) | required_jobs(base, current['paths'])
 
 
-def verify_local(root, current, manifest, run):
-    if 'review' in manifest:
-        try:
-            validate_review(root, manifest['review'], current['paths'], load_context(root))
-        except RuntimeError as error:
-            raise CheckFailed(str(error), source=True) from error
-    ui_required = manifest['ui'].get('required') is True or any(
-        Path(path).suffix in {'.vue', '.css', '.scss', '.sass', '.less'} for path in current['paths'])
-    ui = manifest['ui']
-    if ui_required and (ui.get('required') is not True or ui.get('status') != 'verified' or not ui.get('scenarios') or not ui.get('screenshots')):
-        raise RuntimeError('changed UI requires actual owned runtime scenarios/screenshots; static review is not proof')
-    if ui_required and ui.get('source_key') != source_key(root):
-        raise CheckFailed('UI source bytes changed since capture; re-exercise the screen on final content', source=True)
-    for name in ui.get('screenshots', []):
+def verify_ui(root, current, manifest):
+    if needs_ui(current, manifest):
+        raise RuntimeError('changed UI requires actual owned runtime scenarios/screenshots on final runtime bytes')
+    for name in manifest['ui'].get('screenshots', []):
         path = Path(name)
         if not path.is_absolute():
             path = root / path
@@ -359,33 +456,92 @@ def verify_local(root, current, manifest, run):
             header = stream.read(24)
         if header[:8] != b'\x89PNG\r\n\x1a\n' or len(header) != 24 or not all(struct.unpack('>II', header[16:24])):
             raise RuntimeError('UI artifact is not a nonzero PNG frame')
+
+
+def verify_local(root, current, manifest, run):
     required = ci_requirements(root, current)
     commands = test_commands(root, manifest['tests'])
     selected = {layer for layer, _ in commands}
-    missing = {name.removeprefix('Tests · ').lower() for name in required if name.startswith('Tests · ')} - selected
-    if missing:
-        raise RuntimeError('plan must select directly affected native tests for CI layers: ' + ', '.join(sorted(missing)))
+    if not manifest['tests'] and required and not manifest.get('test_selection'):
+        raise RuntimeError('empty local test selection needs an impact-based reason; server CI remains mandatory')
     proofs = []
     env = {**os.environ, 'TZ': 'Europe/Moscow', 'NODE_ENV': 'test', 'CONSOLA_LEVEL': '0'}
-    roles = {name.removeprefix('Typecheck · ').lower() for name in required if name.startswith('Typecheck · ')}
+    identity = {'source_key': current['source_key'], 'policy': policy_key(root),
+                'manifest_sha256': sha256(run / 'implementation.json'), 'required_ci': sorted(required),
+                'environment_sha256': hashlib.sha256(json.dumps(dict(os.environ), sort_keys=True).encode()).hexdigest()}
+    checkpoint = run / 'progress.json'
+    if checkpoint.is_symlink():
+        raise RuntimeError('check progress must not be a symlink')
+    progress = json.loads(checkpoint.read_text()) if checkpoint.is_file() else {}
+    if progress.get('identity') != identity:
+        progress = {'identity': identity, 'checks': [], 'next': None}
+
+    def perform(name, command, environment=None, test_report=False):
+        selection = {'name': name, 'command': command}
+        index = len(proofs)
+        if index < len(progress['checks']):
+            completed = progress['checks'][index]
+            if completed['selection'] != selection:
+                raise RuntimeError('checkpointed check selection changed; no stale reuse')
+            validate_check_evidence(completed['proof'], run)
+            proofs.append(completed['proof'])
+            return
+        pending = progress['next']
+        if pending and (pending['selection'] != selection or pending['status'] != 'pending'):
+            raise RuntimeError('previous check started or has unknown outcome; no automatic retry')
+        progress['next'] = {'selection': selection, 'status': 'running'}
+        save(checkpoint, progress)
+        report = run / (name + '.json') if test_report else None
+        actual = [*command, '--reporter=json', '--outputFile=' + str(report)] if test_report else command
+        try:
+            proof = checked(root, actual, run / (name + '.log'), environment, report=report)
+        except CheckFailed as failure:
+            progress['next']['status'] = 'pending' if failure.kind == 'deferred' else 'failed'
+            save(checkpoint, progress)
+            raise
+        if test_report:
+            data = json.loads(report.read_text())
+            proof.update(report=str(report), report_sha256=sha256(report), tests=data['numTotalTests'])
+        proofs.append(proof)
+        progress['checks'].append({'selection': selection, 'proof': proof})
+        progress['next'] = None
+        save(checkpoint, progress)
+
+    apps = {TYPECHECK_APPS[name] for name in required if name.startswith('Typecheck · ')}
+    roles = {('form' if app == 'exchange-form' else app.removeprefix('payscrow-')) for app in apps}
     for role in sorted(roles | selected):
-        profile = role + '-tests'
-        proofs.append(checked(root, [str(PROJECTS / 'project-environment'), '--profile', profile, '--install', '--prepare'],
-                              run / ('prepare-' + role + '.log')))
-    for number, (layer, command) in enumerate(commands):
-        report = run / f'test-{number}.json'
-        command = [*command, '--reporter=json', '--outputFile=' + str(report)]
+        perform('prepare-' + role, [str(PROJECTS / 'project-environment'), '--profile',
+                                   role + '-tests', '--install', '--prepare'])
+    for number, (_layer, command) in enumerate(commands):
         guarded = [str(GUARD), '--need', '3G', '--wait', '60', '--exclusive-key', str(root), '--', *command]
-        proofs.append(checked(root, guarded, run / f'test-{number}.log', env, report=report))
-        data = json.loads(report.read_text())
-        if data.get('success') is not True or data.get('numTotalTests', 0) <= 0 or data.get('numFailedTests') != 0:
-            raise RuntimeError('native test report has no successful executed cases: ' + str(report))
-        proofs[-1].update(report=str(report), report_sha256=sha256(report), tests=data['numTotalTests'])
-    for role in sorted(roles):
-        proofs.append(checked(root, [sys.executable, str(HERE / 'typecheck'), 'payscrow-' + role],
-                              run / ('typecheck-' + role + '.log')))
-    return {'source': current, 'checks': proofs, 'ui': ui, 'required_ci': sorted(required),
-            'manifest_sha256': sha256(run / 'implementation.json')}
+        perform(f'test-{number}', guarded, env, test_report=True)
+    for app in sorted(apps):
+        perform('typecheck-' + app, [sys.executable, str(HERE / 'typecheck'), app])
+    if len(proofs) != len(progress['checks']) or progress['next']:
+        raise RuntimeError('checkpoint contains an unexpected check; no stale reuse')
+    return {'source': current, 'checks': proofs, 'ui': manifest['ui'], 'required_ci': sorted(required),
+            'manifest_sha256': identity['manifest_sha256']}
+
+def validate_check_evidence(check, run):
+    for key, hash_key in (('log', 'sha256'), ('report', 'report_sha256')):
+        if key not in check:
+            continue
+        artifact = Path(check[key])
+        if not artifact.resolve().is_relative_to(run.resolve()) or artifact.is_symlink() or sha256(artifact) != check[hash_key]:
+            raise RuntimeError('cached check evidence changed; no stale phase reuse')
+
+
+
+def cached_checks(root, current, run):
+    path = run / 'code-proof.json'
+    if not path.is_file() or path.is_symlink():
+        return None
+    proof = json.loads(path.read_text())
+    if proof['source']['source_key'] != current['source_key']:
+        return None
+    for check in proof['checks']:
+        validate_check_evidence(check, run)
+    return proof
 
 def render_report(root, manifest, proof):
     lines = ['# Feature refactor report', '',
@@ -455,6 +611,7 @@ def owner_opt_out(root, current, path, manifest_path, reason):
     save(run / 'implementation.json', manifest)
     key = policy_key(root)
     proof = verify_local(root, current, manifest, run)
+    verify_ui(root, current, manifest)
     if snapshot(root) != current or policy_key(root) != key:
         raise RuntimeError('inputs changed during owner opt-out verification; no stale receipt')
     proof['sol'] = {'status': 'not-run', 'owner_opt_out': reason.strip()}
@@ -481,18 +638,25 @@ def needs_ui(current, manifest):
     required = ui.get('required') is True or any(
         Path(name).suffix in {'.vue', '.css', '.scss', '.sass', '.less'} for name in current['paths'])
     return required and (ui.get('required') is not True or ui.get('status') != 'verified'
-                         or ui.get('source_key') != current['source_key']
+                         or ui.get('runtime_key') != current['runtime_key']
                          or not ui.get('scenarios') or not ui.get('screenshots'))
 
 
-def await_ui(root, run, key, attempt, post_commit=False, phase='awaiting_ui'):
+def await_ui(root, run, key, attempt, post_commit=False, phase='awaiting_ui', expected_remote_sha=None):
     artifacts = {name: sha256(run / name) for name in
-                 ('source.json', 'feature.diff', 'refactor.md', 'review-context.json', 'plan.md', 'implementation.json')}
+                 ('source.json', 'feature.diff', 'code-rules.md', 'review-context.json', 'plan.md', 'implementation.json')}
+    if (run / 'code-proof.json').is_file():
+        artifacts['code-proof.json'] = sha256(run / 'code-proof.json')
+    for checkpoint in run.glob('checks-*/progress.json'):
+        artifacts[str(checkpoint.relative_to(run))] = sha256(checkpoint)
     state = {'schema': 1, 'phase': phase, 'root': str(root),
              'source': snapshot(root, allow_dirty=True), 'policy': key,
-             'attempt': attempt, 'post_commit': post_commit, 'artifacts': artifacts}
+             'attempt': attempt, 'post_commit': post_commit, 'artifacts': artifacts,
+             'expected_remote_sha': expected_remote_sha}
     save(run / 'state.json', state)
     command = ['wt', 'finalize', '--', '--resume', str(run)]
+    if expected_remote_sha is not None:
+        command += ['--expected-remote-sha', expected_remote_sha]
     if phase == 'awaiting_ui':
         command += ['--ui-proof', str(run / 'ui-proof.json')]
     print(json.dumps({'state': phase, 'run': str(run), 'resume': command,
@@ -502,16 +666,20 @@ def await_ui(root, run, key, attempt, post_commit=False, phase='awaiting_ui'):
     return 0
 
 
-def load_resume(root, path, requested, current, key):
+def load_resume(root, path, requested, current, key, expected_remote_sha=None):
     run = Path(requested).absolute()
     if run.parent != path or any(p.is_symlink() for p in (run, *run.parents)):
         raise RuntimeError('resume requires an owned direct run directory, without symlinks')
     state = json.loads((run / 'state.json').read_text())
     if (state.get('schema') != 1 or state.get('phase') not in {'awaiting_ui', 'awaiting_checks'}
             or state.get('root') != str(root) or state.get('source') != current or state.get('policy') != key
-            or state.get('attempt') not in (0, 1) or not isinstance(state.get('post_commit'), bool)):
+            or state.get('attempt') not in (0, 1) or not isinstance(state.get('post_commit'), bool)
+            or state.get('expected_remote_sha') != expected_remote_sha):
         raise RuntimeError('resume source/policy/state drift; failed or running attempts cannot be replayed')
-    expected = {'source.json', 'feature.diff', 'refactor.md', 'review-context.json', 'plan.md', 'implementation.json'}
+    expected = {'source.json', 'feature.diff', 'code-rules.md', 'review-context.json', 'plan.md', 'implementation.json'}
+    if 'code-proof.json' in state.get('artifacts', {}):
+        expected.add('code-proof.json')
+    expected.update(str(checkpoint.relative_to(run)) for checkpoint in run.glob('checks-*/progress.json'))
     if set(state.get('artifacts', {})) != expected or any(
             (run / name).is_symlink() or sha256(run / name) != digest
             for name, digest in state['artifacts'].items()):
@@ -520,7 +688,7 @@ def load_resume(root, path, requested, current, key):
 
 
 def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, manifest=None, reason=None,
-           merge=False, sessions=None, resume=None, ui_proof=None):
+           merge=False, sessions=None, resume=None, ui_proof=None, expected_remote_sha=None):
     if (resume and skip_sol) or (ui_proof and not resume):
         raise RuntimeError('--ui-proof requires --resume; --resume cannot change the Sol opt-out contract')
     root = owned_root(root)
@@ -529,6 +697,7 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
         print(json.dumps({'branch': initial['branch'], 'source': initial, 'hotfix': hotfix(initial['branch']),
                           'model': MODEL, 'thinking': 'high', 'service_tier': 'priority',
                           'skip_sol': skip_sol, 'keep_source_branch': keep_source,
+                          'expected_remote_sha': expected_remote_sha,
                           'current_receipt': current_receipt(root, initial),
                           'required_ci': sorted(ci_requirements(root, initial)),
                           'plan_command': agent_command(root, [], True),
@@ -546,19 +715,20 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
         if not initial['paths']:
             raise RuntimeError('feature diff is empty; no new feature to finalize')
         mr = find_mr(root, initial['branch'], iid)
+        publication = publication_plan(root, initial, expected_remote_sha)
         if mr:
-            validate_mr(mr, initial['branch'], mr['sha'])
+            validate_mr(mr, initial['branch'], publication['remote_sha'], require_mergeable=False)
             mr = ensure_manual_merge(root, mr)
-            subprocess.run(['git', 'fetch', 'origin', 'refs/heads/' + initial['branch']], cwd=root, check=True)
-            subprocess.run(['git', 'merge-base', '--is-ancestor', mr['sha'], initial['head']], cwd=root, check=True)
         if skip_sol:
             owner_opt_out(root, initial, path, manifest, reason)
+        elif not resume and documentation_only(root, initial) and not current_receipt(root, initial):
+            review_documentation(root, initial, path)
         if not current_receipt(root, initial):
             key = policy_key(root)
             prompt = (HERE / 'finalize-prompt.md').read_text() + '\n\n' + (HERE / 'review-contract.md').read_text()
             resumed, post_commit, start_attempt = bool(resume), False, 0
             if resumed:
-                run, saved = load_resume(root, path, resume, initial, key)
+                run, saved = load_resume(root, path, resume, initial, key, expected_remote_sha)
                 start_attempt, post_commit = saved['attempt'], saved['post_commit']
                 manifest = json.loads((run / 'implementation.json').read_text())
                 if ui_proof:
@@ -577,11 +747,11 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
                     raise RuntimeError('full feature diff exceeds the reviewed input bound; never truncate')
                 (run / 'feature.diff').write_bytes(inputs)
                 save(run / 'source.json', initial)
-                (run / 'refactor.md').write_bytes((root / '.claude/commands/refactor.md').read_bytes())
+                (run / 'code-rules.md').write_bytes((root / '.agents/rules/p2p-code.md').read_bytes())
                 (run / 'review-context.json').write_bytes(context_path(root).read_bytes())
                 (run / 'plan-request.md').write_text(prompt + '\n\nPHASE: PLAN ONLY. Read tools only. Return a concrete refactor plan, findings, backend handoffs and exact native test selections. Do not modify code.\n')
                 save(run / 'state.json', {'phase': 'plan_running'})
-                run_agent(root, [run / 'plan-request.md', run / 'source.json', run / 'feature.diff', run / 'refactor.md',
+                run_agent(root, [run / 'plan-request.md', run / 'source.json', run / 'feature.diff', run / 'code-rules.md',
                                  run / 'review-context.json'], run / 'plan.md', True)
                 if snapshot(root) != initial or policy_key(root) != key:
                     raise RuntimeError('plan phase changed source/policy; stop rather than review mixed revisions')
@@ -591,7 +761,7 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
                     save(run / 'state.json', {'phase': 'source_running', 'attempt': attempt})
                     (run / 'implement-request.md').write_text(prompt + '\n\nPHASE: IMPLEMENT SOURCE ONLY. Apply the saved plan. Do not start browsers, unit tests/typecheck, commit, push or merge. Controller/main owns subsequent checks and UI. Never edit .gitlab-ci.yml or workflow helpers. Save the complete JSON manifest at ' + str(run / 'implementation.json') + '. Include source_key from feature-finalize --source-key after all edits. UI evidence not already valid for these bytes must be pending, not verified. Leave edits unstaged. Prior diagnostics are in ' + str(run) + '.\n')
                     phase_head = git(root, 'rev-parse', 'HEAD')
-                    run_agent(root, [run / 'implement-request.md', run / 'source.json', run / 'feature.diff', run / 'refactor.md',
+                    run_agent(root, [run / 'implement-request.md', run / 'source.json', run / 'feature.diff', run / 'code-rules.md',
                                      run / 'review-context.json', run / 'plan.md'], run / f'implementation-{attempt}.log', False)
                     if git(root, 'rev-parse', 'HEAD') != phase_head:
                         raise RuntimeError('implementation must not create commits; source identity changed')
@@ -606,15 +776,15 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
                     raise RuntimeError('refactor must not change server-side CI')
                 pending = snapshot(root, allow_dirty=True)
                 save(run / 'implementation.json', manifest)
-                if needs_ui(pending, manifest):
-                    return await_ui(root, run, key, attempt, post_commit)
-                validate_review(root, manifest.get('review'), pending['paths'], load_context(root))
                 save(run / 'state.json', {'phase': 'checks_running', 'attempt': attempt})
                 try:
-                    checks = run / (f'checks-{attempt}-' + str(time.time_ns()))
-                    checks.mkdir()
-                    save(checks / 'implementation.json', manifest)
-                    proof = verify_local(root, pending, manifest, checks)
+                    proof = cached_checks(root, pending, run)
+                    if proof is None:
+                        checks = run / (f'checks-{attempt}' + ('-after-hooks' if post_commit else ''))
+                        checks.mkdir(exist_ok=True)
+                        save(checks / 'implementation.json', manifest)
+                        proof = verify_local(root, pending, manifest, checks)
+                        save(run / 'code-proof.json', proof)
                     if snapshot(root, allow_dirty=True) != pending or policy_key(root) != key:
                         raise RuntimeError('checked inputs changed during verification; no stale receipt')
                     if not post_commit:
@@ -633,16 +803,22 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
                             raise RuntimeError('batch verification failed; inspect evidence, no resource retry or hook bypass')
                     current = snapshot(root)
                     if current['source_key'] != pending['source_key']:
-                        if needs_ui(current, manifest):
-                            return await_ui(root, run, key, attempt, post_commit=True)
                         checks = run / f'checks-{attempt}-after-hooks'
-                        checks.mkdir()
+                        checks.mkdir(exist_ok=True)
                         save(checks / 'implementation.json', manifest)
                         proof = verify_local(root, current, manifest, checks)
-                    proof['source'] = current
+                        save(run / 'code-proof.json', proof)
+                    if needs_ui(current, manifest):
+                        return await_ui(root, run, key, attempt, post_commit=True, expected_remote_sha=expected_remote_sha)
+                    verify_ui(root, current, manifest)
+                    try:
+                        validate_review(root, manifest.get('review'), current['paths'], load_context(root))
+                    except RuntimeError as error:
+                        raise CheckFailed(str(error), source=True) from error
+                    proof.update(source=current, ui=manifest['ui'])
                 except CheckFailed as failure:
                     if failure.kind == 'deferred':
-                        return await_ui(root, run, key, attempt, post_commit, phase='awaiting_checks')
+                        return await_ui(root, run, key, attempt, post_commit, phase='awaiting_checks', expected_remote_sha=expected_remote_sha)
                     save(run / 'state.json', {'phase': 'failed', 'kind': failure.kind, 'attempt': attempt})
                     if not failure.source or attempt == 1:
                         raise
@@ -661,7 +837,9 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
         current = snapshot(root)
         if not current_receipt(root, current):
             raise RuntimeError('no current feature review receipt; merge is blocked')
-        subprocess.run(['wt', 'push', '--', 'origin', current['branch']], cwd=root, check=True)
+        if remote_tip(root, current['branch']) != publication['remote_sha']:
+            raise RuntimeError('remote tip changed during review; inspect new commits before publishing')
+        subprocess.run(['wt', 'push', '--', *publication['options'], 'origin', current['branch']], cwd=root, check=True)
         remote = git(root, 'ls-remote', '--heads', 'origin', 'refs/heads/' + current['branch']).split()
         if not remote or remote[0] != current['head']:
             raise RuntimeError('published source SHA is not the reviewed HEAD')
@@ -672,15 +850,15 @@ def finish(root, iid=None, dry_run=False, keep_source=False, skip_sol=False, man
             mr = find_mr(root, current['branch'])
         if mr is None:
             raise RuntimeError('MR creation did not yield an unambiguous open MR')
-        validate_mr(mr, current['branch'], current['head'])
+        validate_mr(mr, current['branch'], current['head'], require_mergeable=merge)
         mr = ensure_manual_merge(root, mr)
-        ci = wait_for_ci(root, mr['iid'], current['branch'], current['head'], ci_requirements(root, current))
+        ci = wait_for_ci(root, mr['iid'], current['branch'], current['head'], ci_requirements(root, current), require_mergeable=merge)
         save(path / 'ci.json', ci)
         if snapshot(root) != current or not current_receipt(root, current):
             raise RuntimeError('source/target/owner context changed before delivery; review again')
         if not merge:
             mr = ensure_manual_merge(root, Forge(root).mr(mr['iid']))
-            validate_mr(mr, current['branch'], current['head'])
+            validate_mr(mr, current['branch'], current['head'], require_mergeable=False)
             delivery = {'state': 'mr-ready', 'mr': mr['iid'], 'sha': current['head'],
                         'target': 'dev', 'url': mr.get('web_url'), 'source_preserved': True,
                         'auto_merge': False, 'ci': ci, 'review_receipt': str(path / 'receipt.json')}
@@ -726,21 +904,23 @@ def main():
     parser.add_argument('--merge', action='store_true', help='only after a separate explicit owner instruction to merge')
     parser.add_argument('--session', type=Path, action='append', help='originating owner transcript; repeat for explicit parent lineage')
     parser.add_argument('--dry-run', action='store_true')
-    parser.add_argument('--source-key', action='store_true', help='read-only runtime source content fingerprint')
+    parser.add_argument('--source-key', action='store_true', help='read-only complete source content fingerprint')
+    parser.add_argument('--runtime-key', action='store_true', help='UI fingerprint excluding only native test source files')
     parser.add_argument('--keep-source-branch', action='store_true', help='preserve remote source after merge')
     parser.add_argument('--skip-sol', action='store_true', help='only for an explicit owner opt-out; native checks still required')
     parser.add_argument('--manifest', type=Path, help='native test/UI selections for --skip-sol')
     parser.add_argument('--reason', help='verbatim owner reason/request to skip Sol')
     parser.add_argument('--resume', type=Path, help='continue an unchanged awaiting_ui run; never replay failed workloads')
     parser.add_argument('--ui-proof', type=Path, help='owned JSON with source-bound ui and optional refreshed review')
+    parser.add_argument('--expected-remote-sha', help='exact observed remote task SHA for a separately authorized published rebase')
     args = parser.parse_args()
     root = Path(git(Path.cwd(), 'rev-parse', '--show-toplevel'))
-    if args.source_key:
-        print(source_key(owned_root(root)))
+    if args.source_key or args.runtime_key:
+        print((runtime_key if args.runtime_key else source_key)(owned_root(root)))
         return 0
     return finish(root, args.mr, args.dry_run, args.keep_source_branch, args.skip_sol,
                   args.manifest, args.reason, merge=args.merge, sessions=args.session,
-                  resume=args.resume, ui_proof=args.ui_proof)
+                  resume=args.resume, ui_proof=args.ui_proof, expected_remote_sha=args.expected_remote_sha)
 
 
 if __name__ == '__main__':

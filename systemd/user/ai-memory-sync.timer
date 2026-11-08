@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile memory without the desktop panel
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=ai-memory-sync.service
+
+[Install]
+WantedBy=timers.target

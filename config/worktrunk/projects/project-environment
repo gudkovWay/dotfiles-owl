@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 from resource_guard import reserve_environment
+from dev_support import resource_snapshot
 
 HERE = Path(__file__).resolve().parent
 GUARD = HERE / 'guarded-run'
@@ -343,6 +344,8 @@ def main():
     print(json.dumps({'repository': repo, 'root': str(root), 'profile': args.profile, **status},
                      ensure_ascii=False), flush=True)
     print('project-environment: requested prerequisites ready')
+    print(json.dumps({'event': 'profile_resources', 'phase': 'cold',
+                      'profile': args.profile, 'resources': resource_snapshot()}), flush=True)
 
 
 if __name__ == '__main__':

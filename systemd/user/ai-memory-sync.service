@@ -1,0 +1,18 @@
+[Unit]
+Description=Finite typed memory reconciliation and consolidation
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/q/storage/ai
+Environment=OMP_MEMORY_INTERNAL=1
+Environment=Q_STORAGE_UPDATE=0
+Environment=PATH=/home/q/.cache/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/q
+Environment=XDG_DATA_HOME=/home/q/.local/share
+Environment=XDG_STATE_HOME=/home/q/.local/state
+Environment=XDG_CACHE_HOME=/home/q/.cache
+Environment=OMP_PROFILE=default
+Environment=OMP_MEMORY_OMP_BIN=/home/q/.cache/.bun/bin/omp
+ExecStart=/home/q/.config/worktrunk/projects/guarded-run --need 1G --wait 60 --exclusive-key /home/q/storage/memory -- python3 /home/q/storage/ai/bin/memory_sync.py run --limit 1 --capture-limit 4
+TimeoutStartSec=720
+UMask=0077

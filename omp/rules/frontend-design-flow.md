@@ -13,9 +13,29 @@ Read `skill://design-taste-frontend` before web UI implementation. Installed roo
 
 Existing explicit owner direction, supplied references, brand constraints and the surrounding design system come first. A bounded component, responsive fix or behavior fix reuses that direction; do not redraw the site or reopen settled choices. Taste owns direction; Anti Slop filters execution. Do not add a second frontend-design workflow.
 
+Before using a component as a reference, state the requested direction: what is the destination, what must change and what must remain. A component index is navigation, not approval of a mandatory visual standard. If the owner asks to align inputs and other controls toward new selects, do not roll the selects back toward legacy inputs. Current explicit corrections outrank historical patterns and agent-authored direction sheets; newness alone establishes neither acceptance nor permission for a wider rollout.
+
 Before writing UI code, record the applicable direction: product/audience, primary user action, subject-specific idea, section or screen composition, typography, palette, real imagery, ENERGY/RHYTHM/MOTION, and material assumptions. Include a one-line purpose for the major visual choices. Use the existing local spec, or chat for a bounded change. Proposed choices are not owner-approved merely because the agent wrote them. Follow the task's normal design-approval and autonomy boundaries; once direction is settled, do not restart approval for each choice.
 
 Taste's direction sheet is a proposal constrained by the brief, not permission to copy a template. Do not force content into a dealt composition. Keep the existing framework, routes, forms and behaviors unless changing them is requested.
+
+### Bounded fixes: an observable invariant
+
+For a spacing/alignment fix, state the object, direction and visible boundary
+before editing: e.g. the whole child container starts to the right of its parent,
+including the selected background, not only its text. Use the owner's exact
+distance when given; otherwise reuse the design system. Do not turn a padding
+request into a redesign. Record the criterion in the existing task/spec, not a
+second ledger; a later concept choice does not remove earlier requirements.
+
+Compare before/after on the same route, fixture, viewport, theme and state.
+Inspect the settled final frame after the LAST relevant edit, not only an
+intermediate concept. For affected control families check background, borders,
+label/value/placeholder color and weight, spacing and applicable hover/focus/
+selected/disabled states. Preserve distinctions the owner did not ask to remove.
+Native tests/typecheck do not prove geometry or icon readability at actual size.
+CSS viewport, device scale and real browser zoom are different observations;
+report the requested one unverified if it was not exercised.
 
 ### Redesign: reference → before → after, not a component rename
 
@@ -59,9 +79,7 @@ complete. Review-only requests still stop at findings.
 
 ## 2. Anti Slop during implementation
 
-Read `skill://antislop` and only the relevant modules (`antislop-ui`, `antislop-human`, `antislop-layoutmobile`, `antislop-copywriting`, `antislop-code`). In this OMP flow the saved owner default is **during**. It takes precedence over the upstream default mode question and shared settings; do not ask during/after again. An explicit owner mode choice for the current task/session wins, including `after` with its read-only audit/selected-fixes boundary.
-
-Use the honest notice `antislop active: during (OMP workflow default).` once before the first UI edit; identify a session override when one exists. Do not claim to have read a shared global preference when this OMP rule selected the mode. For read-only audits place the notice with final findings, not progress messages. Anti Slop is already installed: do not run its first-install wizard or append pointer blocks to project entry files as a side effect. Do not change cross-harness settings to implement this OMP-only default.
+Read `skill://antislop` and only the relevant modules (`antislop-ui`, `antislop-human`, `antislop-layoutmobile`, `antislop-copywriting`, `antislop-code`). Follow `rule://antislop-workflow` for mode resolution, notices, installed-state handling and task-permission boundaries; do not establish a separate web UI mode policy here.
 
 During implementation, filter unmotivated template sections, irrelevant decoration, generic copy and dead controls. Preserve the recorded design direction and useful code-comment context. Check states, keyboard/focus, responsive reflow and truthful content as part of implementation, not as optional polishing.
 
@@ -84,6 +102,18 @@ Taste helper paths are `/home/q/.omp/agent/skills/design-taste-frontend/scripts/
 Put direction sheets/specs under the owned worktree's locally ignored `.superpowers/specs/`, audit/inspection results under `.superpowers/research/`, and agent-only media under `.superpowers/assets/`. Do not create project `DESIGN.md`, docs, audit folders or root `.taste-skill/` as an unrequested side effect. Promote only real deliverable assets into product paths. Ensure local ignore before writing working artifacts; do not change project `.gitignore` for agent scratch.
 
 For `draw.mjs`, pass an absolute `--out <worktree>/.superpowers/specs/taste` and set `TASTE_SKILL_HISTORY=<worktree>/.superpowers/specs/taste/history.json` on the command. For other helpers, use their verified output option or an isolated cwd under `.superpowers/` with absolute input paths. Do not silently write history to `~/.taste-skill/`. Keep inspector browser profiles in a unique owned `TASTE_SKILL_TMP` directory, never a personal profile or shared profile-cleanup namespace.
+
+Before browser driving, read `xd://eval/browser` once for the current API.
+Its direct helpers and raw page context are not Playwright: do not assume
+`getByRole`, mixed role/CSS selectors or array-shaped diagnostics. Read the
+actual returned shape; execute DOM predicates in page context. After navigation,
+rerender or an action error, re-observe and scope selectors to the current
+dialog/state before acting again. Plan a finite scenario and capture the
+settled final state within the owned runtime window; no blind extension/retry.
+
+Before claiming a preview is open with the changes, confirm its owned readiness,
+actual URL, worktree/source identity and expiry. Opening a URL alone does not
+start a server or prove that an expired preview still serves the requested code.
 
 Verification follows `skill://repository-testing`, `rule://no-autotests`, `rule://heavy-jobs-resource-guard` and the owned-surface rules. Use native regressions/typecheck and the reviewed isolated headless runtime; Taste diagnostics do not replace those entrypoints or authorize an extra dev server/browser. Do not run an unsafe helper merely to satisfy an upstream gate. If a required check cannot run, report that check as blocked/unverified, never PASS.
 

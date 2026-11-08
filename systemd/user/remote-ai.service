@@ -1,0 +1,23 @@
+[Unit]
+Description=remote-ai: Telegram remote for Claude Code sessions
+# После графической сессии: пульт открывает окна, а значит ему нужен
+# WAYLAND_DISPLAY, который приезжает из неё.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/q/dev/ai/remote-ai-manage
+ExecStart=/home/q/dev/ai/remote-ai-manage/.venv/bin/python -m remote
+Restart=always
+RestartSec=5
+# Потолок памяти: свежий демон весит ~200 МБ, но за дни anon медленно
+# расползается (замер 19.09: пик 1.2 ГБ за 9 ч, 3 ГБ за 2.5 сут, swap-пик
+# 527 МБ). MemoryHigh душит и сбрасывает file cache, MemoryMax убивает
+# утёкшего — Restart=always поднимает за 5 с, окна сессий вне cgroup.
+MemoryHigh=350M
+MemoryMax=600M
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

@@ -13,7 +13,7 @@ OMP-global root: `/home/q/.omp/agent/skills/repository-testing/`. No helper scri
 
 ## Current state
 
-2026-10-21: p2p dev/UI reuses ready inputs or prepares audited missing prerequisites in one capped/exclusive scope; native test profiles cover common/admin/form/merchant/provider. Minimal DEV grants use the exact test account, existing UI and persisted-state verification below. Ecom retains explicit preparation. Local typecheck keeps its fixed-budget native CI profile. [OVERSIZE: 249 lines - native discovery, typecheck, readiness, credentials, DEV grants and UI isolation form one verification contract]
+2026-11-05: prose/command-only uses native parser/discovery checks; regressions isolate the target guard and runtime starts at the user entrypoint. Existing capped p2p/ecom preparation, DEV grants and complete native typecheck contracts remain unchanged. [OVERSIZE: 299 lines - native discovery, desktop verification, typecheck, readiness, credentials, DEV grants and UI isolation form one verification contract]
 
 ## 1. Discover the actual test contract
 
@@ -22,9 +22,42 @@ OMP-global root: `/home/q/.omp/agent/skills/repository-testing/`. No helper scri
 3. Follow the existing authoritative entrypoint: package/task script, Make target, language manifest or CI command. Read nested scripts and pre/post hooks before executing them; a command named `test` may install dependencies, prepare/build apps, start services or launch multiple suites.
 4. Identify the package manager and locally installed runner/version from the manifest, lockfile and available environment. No network-resolving `npx`, auto-installing `uv`, package-manager bootstrap or alternate runner as a convenience.
 5. Record required cwd, configuration/root, setup fixtures, environment variables, variants and service dependencies. Existing examples and configuration outrank a generic command table.
-6. If no test stack is configured, report `no configured test stack`. Do not install one or copy another repo's conventions without approval.
+6. If no test stack is configured, report `no configured test stack`. Do not install one or copy another repo's conventions without approval. For a changed desktop tool, this does not prohibit the separate finite native runtime check below.
+7. CI availability is not a prerequisite for discovering or running native local checks. Use manifests/task scripts and native configs when CI is absent or disabled; do not invent a missing CI entrypoint or install workflows. For CI merge applicability and required-check discovery, use `skill://starting-worktree-work`, §7; its p2p gate is not a global requirement that every repository have CI.
 
 End condition: each affected behavior has an identified test home/entrypoint; changed typed inputs have identified typecheck projects/entrypoints, or a named missing prerequisite.
+
+### Prose and command-only applicability
+
+Classify the changed behavior before selecting application gates. Pure prose,
+skill/rule text and non-executing command instructions need their native
+parser/discovery/contract checks, not an unrelated Nuxt build, UI stand or
+application typecheck. File extension alone is not proof: executable helpers,
+embedded runnable logic, typed configuration and their consumers keep the
+relevant native tests/typecheck. Source review, hooks and delivery permissions
+remain independently applicable; never invent a helper flag to skip a gate.
+
+### Native desktop runtime
+
+A request to implement/fix a desktop tool includes its finite isolated runtime check
+under `rule://no-autotests`, §6а. Read `skill://desktop-sandbox`, select the actual
+native entrypoint and prepare the necessary test config yourself; do not ask the
+owner to create a stand or approve each owned launch/capture step. Use a separate
+instance, never a live process restart, config overwrite or singleton IPC forwarding.
+Build the changed target through its native entrypoint only when needed for these
+source bytes. Choose hidden special placement for ordinary windows, owned headless
+for web, and a separate compositor for shell/layer-shell/compositor or independent
+input. The skill owns path/profile/socket preflight, live preservation and teardown.
+Record the exact finite scenario and observed result separately from native tests;
+no test stack is not permission to invent a runner, and startup is not interaction.
+Read-only/no-run tasks remain read-only; infrastructure/resource retries keep their
+existing authorization boundary.
+
+Start the finite scenario at the real user entrypoint: launcher/menu/route,
+then the changed action, persisted state and relevant response. A direct
+internal panel/RPC call does not prove the menu exists; syntax/import success
+does not prove an Android bridge or settings control works on its actual ABI.
+Missing device/runtime remains explicit, not an installed/active claim.
 
 ## Readiness follows the proof
 
@@ -80,9 +113,22 @@ End condition: each affected behavior has an identified test home/entrypoint; ch
   observe/geometry: initial open viewport при attach может не примениться.
   Ожидать реальный screen selector, а не networkidle в dev/HMR приложении.
 - Пользовательский URL p2p dev — `http://localhost:<port>`, хотя owned listener
-  привязан к 127.0.0.1. Backend preflight допускает localhost:3000, но не
-  127.0.0.1:3000. Для другого порта проверять CORS, не отключать browser security
-  и не считать сетевой отказ доказательством неверного пароля.
+  привязан к 127.0.0.1. Общий lease pool dev/UI: только 3000, 3001, 3002.
+  OPTIONS к DEV API подтвердил эти три origins; 56777 не разрешён.
+  Четвёртый preview получает deferred75, без takeover или случайного порта.
+  Не отключать browser security и не считать сетевой отказ неверным паролем.
+  Использовать фактический URL из JSON `event=ready`, а не предполагать 3000.
+  Readiness требует owned listener + HTTP200 и печатает root/app/branch/HEAD,
+  server PID/cgroup и mode; это не login proof. Для ручного indefinite preview
+  expires_at/remaining_seconds=null; у явно конечного режима — реальные значения.
+  Dev/UI используют PID512 внутри parent2048; thread defaults Nuxt=4 сохраняют
+  явные пользовательские значения. Лимит действует на всё дерево, не на worker.
+  `wt dev -- --app=payscrow-admin` — ручной managed preview до явного stop:
+  named service, внешний timeout0 и guard runtime0, без скрытого age/idle kill.
+  По запросу `--seconds=30..540` — конечный preview. Startup/readiness ограничены
+  отдельно. Не закрывать чужой listener; reservation/port lease освобождаются
+  после подтверждённого teardown. `wt ui` — отдельная конечная проверка, не
+  ручной сервер и не основание завершать owner-preview по таймеру.
 - Launcher readiness не доказывает экран: нужен конкретный сценарий, geometry,
   screenshot, console/network evidence и HMR после изменения. Без тестового
   доступа к защищённому экрану — именно этот экран `unverified`, без auth bypass.
@@ -169,6 +215,13 @@ membership или нельзя однозначно установить учё�
 5. In a delegated batch, workers write tests but do not run them. Give test-file ownership explicitly; the orchestrator integrates and executes the combined relevant set once after the batch.
 6. TDD/verification skills remain subordinate to the two rules. If execution is blocked, retain useful test/code changes and report them unverified; do not delete the implementation to satisfy a red-first ritual.
 
+For a guard/gate regression, make other prerequisites valid and vary the target
+condition: e.g. valid email with dictionary pending, then ready. Ask whether the
+test would still pass with the target guard removed; if yes, it does not prove
+that guard. Route/link/settings fixtures must preserve the contract under test,
+including query objects and save/reopen; prefer the real repo component when a
+stub would erase that behavior. Include changed tests/fixtures in native types.
+
 End condition: changed behavior has relevant tests or an explicit reason why none are applicable/configurable, not a blanket claim that tests are forbidden.
 
 ## 3. Select a finite, narrow run
@@ -177,7 +230,7 @@ End condition: changed behavior has relevant tests or an explicit reason why non
 2. Choose the smallest authoritative entrypoint which accepts that selection. A broad composite command may not forward a file filter to its children: use its existing leaf entrypoints, preserving their environment/configuration, and run them sequentially.
 3. Keep the repo's command and append only supported one-shot, filter and concurrency arguments. Verify options in installed-version help/docs before use; never guess flags for an unfamiliar runner.
 4. Default to one worker and serial test execution where the runner supports it, and disable automatic retries. Never change the runner's process pool or substitute a DOM/runtime environment to reduce memory after a failure.
-5. Full-suite, coverage, watch/UI/debug, snapshot acceptance, stress and benchmark modes are not a default scoped run; apply the authorization rule instead of expanding scope silently.
+5. Full-suite, coverage, watch/UI/debug of the test runner, snapshot acceptance, stress and benchmark modes are not a default scoped run; apply the authorization rule. Finite changed-screen/native desktop verification is a separate authorized route, not runner UI/debug mode.
 6. Repository-managed local headless E2E is eligible only if all server/setup processes stay in the guarded cgroup, use an isolated test environment and cannot affect production or the live desktop. Inspect `webServer`, setup/teardown and nested commands first. Do not reuse a live shared server or a remote browser/container daemon outside the cap.
 7. If the entrypoint cannot express a relevant bounded selection, or escapes the guarded cgroup, stop and report the exact blocker. Do not invent a temporary verifier.
 
@@ -213,7 +266,7 @@ End condition: an exact command matrix covers affected CI typecheck projects, wi
 3. Execute the selected command in the resolved worktree. Preserve actual exit code and output, including compiler status through wrappers. Report no-tests-found as missing coverage, not success.
 4. Classify the cause under `rule://no-autotests` §7. Fix assertions, type errors and fixable source/import/transform/fixture/mock configuration errors within scope, then rerun affected checks without another permission question. Resource or infrastructure failures stop the attempt; an error during module loading/prepare is not automatically infrastructure failure.
 5. Verify owned scope teardown and reservation release. Busy/75 is bounded deferral before workload, not an instruction to ask the owner to free RAM. Use `--wait 60`; if it expires, report the precise resource blocker without repeated launches or an uncapped fallback. Other registered jobs may continue.
-6. Report tests, typecheck, UI/runtime and CI/delivery separately. Tests passing do not prove type correctness, rendering or native unload; green local typecheck does not replace CI of the final SHA. Changed checked inputs, including hook mutations, invalidate the affected prior results.
+6. Report tests, typecheck, UI/runtime and CI/delivery separately. Tests passing do not prove type correctness, rendering or native unload; green local typecheck does not replace required CI of the final SHA. Determine CI applicability under `skill://starting-worktree-work`, §7: absent/disabled non-required CI is not itself a delivery blocker or a reason for an owner exception. Report it as not applicable or unverified with the reason, never PASS. Changed checked inputs, including hook mutations, invalidate the affected prior results.
 
 Required decision record in the conversation/report (no repository docs required):
 
@@ -228,6 +281,7 @@ Required decision record in the conversation/report (no repository docs required
 | Symptom | Cause | Action |
 |---|---|---|
 | No command/config/tests found | Repo has no established test stack | Report prerequisite; do not install a runner |
+| No checks/runs or Actions disabled on a fork | Availability mistaken for a mandatory CI contract | Establish applicability under starting-worktree-work §7; retain local checks, do not invent CI or block merge solely on non-required absent CI |
 | A file filter runs everything | Composite script/root/filter mismatch | Inspect native leaf command before running; do not guess |
 | Worker wants to run red/green | TDD conflicts with batch ownership | Worker writes; orchestrator runs after integration |
 | OOM, infrastructure scope/setup failure, timeout or tracked config mutation | Guard/environment blocker | Stop this attempt, preserve unrelated edits, report; no cosmetic retries |

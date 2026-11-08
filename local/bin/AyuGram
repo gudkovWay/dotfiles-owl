@@ -1,0 +1,7 @@
+#!/bin/sh
+profile="$HOME/.local/share/AyuGramDesktop-PaperVim"
+if [ ! -d "$profile/tdata" ]; then
+    printf '%s\n' 'AyuGram: the existing account profile is unavailable; no empty profile is created automatically.' >&2
+    exit 1
+fi
+exec "$HOME/.local/opt/ayugram-frame02-b2-fx-vim-7.2.9/AyuGram" -noupdate -workdir "$profile" "$@"

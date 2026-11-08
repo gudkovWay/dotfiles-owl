@@ -4,7 +4,7 @@ set -l cmds hist new runs sess last resume day days grep note triage ask recall 
 complete -c ai -f
 complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a hist   -d "прогоны и сессии вперемешку"
 complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a new    -d "только не открытое"
-complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a runs   -d "прогоны Qwen"
+complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a runs   -d "архивные прогоны"
 complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a sess   -d "сессии Claude"
 complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a last   -d "последняя запись в редакторе"
 complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a resume -d "продолжить сессию Claude"
@@ -20,7 +20,7 @@ complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a triage  -d "раз�
 complete -c ai -n "not __fish_seen_subcommand_from $cmds" -a build  -d "пересобрать истории"
 
 complete -c ai -n "__fish_seen_subcommand_from triage" \
-  -a "pass review warn guard run escalate list set scan state" -d "что делать с разбором"
+  -a "pass review warn run escalate list set scan state mech" -d "что делать с разбором"
 
 # имена сторов там, где они уместны
 complete -c ai -n "__fish_seen_subcommand_from idx" \

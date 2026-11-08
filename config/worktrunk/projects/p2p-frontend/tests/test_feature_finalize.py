@@ -54,6 +54,33 @@ class BranchTests(unittest.TestCase):
         self.assertIn(b'second', diff)
         self.assertEqual(value['merge_base'], self.base)
 
+
+    def test_test_only_changes_preserve_runtime_identity_but_not_source_identity(self):
+        folder = self.root / 'lib/common-layer/shared/lib'
+        folder.mkdir(parents=True)
+        test = folder / 'amount.test.ts'
+        test.write_text('first test')
+        runtime, source = self.f.runtime_key(self.root), self.f.source_key(self.root)
+        test.write_text('changed test')
+        self.assertEqual(self.f.runtime_key(self.root), runtime)
+        self.assertNotEqual(self.f.source_key(self.root), source)
+        (folder / 'amount.ts').write_text('changed production')
+        self.assertNotEqual(self.f.runtime_key(self.root), runtime)
+
+    def test_local_selection_does_not_mirror_ci_test_matrix(self):
+        run = self.artifacts / 'checks'
+        run.mkdir()
+        manifest = {'tests': [], 'ui': {'required': False},
+                    'test_selection': 'No behavioral change; server CI keeps its complete matrix.'}
+        self.f.save(run / 'implementation.json', manifest)
+        with patch.object(self.f, 'ci_requirements', return_value={'Tests · Form', 'Typecheck · Exchange Form'}), \
+                patch.object(self.f, 'checked', return_value={'exit': 0}) as checked:
+            proof = self.f.verify_local(self.root, self.f.snapshot(self.root), manifest, run)
+        commands = [call.args[1] for call in checked.call_args_list]
+        self.assertTrue(any(command[-1] == 'exchange-form' for command in commands))
+        self.assertTrue(any('form-tests' in command for command in commands))
+        self.assertFalse(any('test:form' in ' '.join(command) for command in commands))
+        self.assertEqual(proof['required_ci'], ['Tests · Form', 'Typecheck · Exchange Form'])
     def test_hotfix_is_precise_not_a_substring_escape(self):
         self.assertTrue(self.f.hotfix('DEV-capitalism-slave-hotfix-dialog'))
         self.assertFalse(self.f.hotfix('DEV-capitalism-slave-not-hotfix-dialog'))
@@ -77,19 +104,13 @@ class BranchTests(unittest.TestCase):
         report.write_text('{"changed":true}')
         self.assertFalse(self.f.receipt_matches(receipt, current, 'policy', report))
 
-    def test_agent_uses_exact_model_high_and_no_tool_delegation(self):
-        command = self.f.agent_command(self.root, [self.root / 'input.md'], plan=True)
-        self.assertIn('--model=openai-codex/gpt-6.1-sol', command)
-        self.assertIn('--thinking=high', command)
-        self.assertIn('--no-prewalk', command)
-        self.assertIn('--no-extensions', command)
-        tools = next(arg for arg in command if arg.startswith('--tools='))
-        self.assertEqual(tools, '--tools=read,glob,grep')
-        command = self.f.agent_command(self.root, [], plan=False)
-        tools = next(arg for arg in command if arg.startswith('--tools='))
-        self.assertEqual(tools, '--tools=read,glob,grep,edit,write,bash,todo,eval')
-        self.assertNotIn('task', tools)
-        self.assertNotIn('ask', tools)
+    def test_agent_uses_restricted_native_runner_without_delegation(self):
+        inputs = [self.artifacts / 'input.md']
+        for plan in (True, False):
+            command = self.f.agent_command(self.root, inputs, plan=plan)
+            self.assertEqual(command[:3], ['bun', str(HERE / 'finalize_agent.mjs'), str(self.root)])
+            self.assertEqual(command[3], 'plan' if plan else 'source')
+            self.assertEqual(command[-1], str(inputs[0]))
 
     def model_output(self, command, **kwargs):
         if command[0] != str(self.f.GUARD):
@@ -111,7 +132,7 @@ class BranchTests(unittest.TestCase):
                 self.f.run_agent(self.root, [], output, plan=plan)
             command = next(call.args[0] for call in run.call_args_list if call.args[0][0] == str(self.f.GUARD))
             self.assertEqual(command[command.index('--tasks') + 1], '256')
-            self.assertIn('--mode=json', command)
+            self.assertIn('plan' if plan else 'source', command)
             self.assertEqual(output.read_text(), 'Completed source review.\n')
 
     def test_exit_zero_without_terminal_message_is_not_completion(self):
@@ -175,6 +196,49 @@ class BranchTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.f.test_commands(self.root, [value])
 
+    def test_form_selection_runs_only_the_native_variant_that_includes_each_file(self):
+        engine = 'lib/form-layer/engine/amount.test.ts'
+        classic = 'lib/form-layer/ui/classic/payment.test.ts'
+        exchange = 'lib/form-layer/ui/exchange/payment.test.ts'
+        for name in (engine, classic, exchange):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('native fixture')
+        for selected, expected in (
+            ([exchange], {'test:form:exchange': [exchange]}),
+            ([engine, classic], {'test:form:classic': [engine, classic]}),
+            ([engine, exchange], {'test:form:classic': [engine], 'test:form:exchange': [exchange]}),
+        ):
+            with self.subTest(selected=selected):
+                commands = self.f.test_commands(self.root, [{'layer': 'form', 'files': selected}])
+                self.assertEqual({command[2]: command[4:command.index('--maxWorkers=1')]
+                                  for _, command in commands},
+                                 {variant: [str(self.root / name) for name in files]
+                                  for variant, files in expected.items()})
+
+    def test_partial_checks_do_not_replay_started_failures_or_changed_evidence(self):
+        manifest = {'tests': [], 'ui': {'required': False}, 'test_selection': 'No application behavior changed.'}
+        current = self.f.snapshot(self.root)
+        for kind in ('resource_failure', 'infrastructure_failure', 'deferred'):
+            with self.subTest(kind=kind):
+                run = self.artifacts / kind
+                run.mkdir()
+                self.f.save(run / 'implementation.json', manifest)
+                def check(_root, command, log, env=None, report=None):
+                    if command[-1] == 'payscrow-admin':
+                        raise self.f.CheckFailed('second check stopped', kind=kind)
+                    log.write_text('completed preparation')
+                    return {'command': command, 'exit': 0, 'log': str(log), 'sha256': self.f.sha256(log)}
+                with patch.object(self.f, 'ci_requirements', return_value={'Typecheck · Admin'}), \
+                        patch.object(self.f, 'checked', side_effect=check) as checked:
+                    with self.assertRaises(self.f.CheckFailed):
+                        self.f.verify_local(self.root, current, manifest, run)
+                    if kind == 'deferred':
+                        (run / 'prepare-admin.log').write_text('changed evidence')
+                    with self.assertRaisesRegex(RuntimeError, 'evidence changed|unknown outcome'):
+                        self.f.verify_local(self.root, current, manifest, run)
+                    self.assertEqual(checked.call_count, 2)
+
     def test_primary_checkout_is_not_an_automatic_delivery_target(self):
         with self.assertRaisesRegex(RuntimeError, 'linked'):
             self.f.owned_root(self.root)
@@ -202,6 +266,46 @@ class BranchTests(unittest.TestCase):
         self.assertEqual(self.f.source_key(self.root), before)
         (self.root / 'new.ts').write_text('different\n')
         self.assertNotEqual(self.f.source_key(self.root), before)
+
+    def test_rebased_publication_requires_exact_remote_tip_and_emits_scoped_lease(self):
+        (self.root / 'a.ts').write_text('feature\n')
+        self.git('commit', '-qam', 'feature')
+        published = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '--detach', '-q', self.base)
+        (self.root / 'base.ts').write_text('new dev\n')
+        self.git('add', 'base.ts')
+        self.git('commit', '-qm', 'dev advanced')
+        self.git('update-ref', 'refs/remotes/origin/dev', self.git('rev-parse', 'HEAD'))
+        self.git('checkout', '-q', 'DEV-capitalism-slave-example')
+        self.git('rebase', 'origin/dev')
+        current = self.f.snapshot(self.root)
+        native_git = self.f.git
+        def observe(root, *args):
+            if args[:2] == ('ls-remote', '--heads'):
+                return published + '\trefs/heads/' + current['branch']
+            if args == ('rev-parse', 'FETCH_HEAD'):
+                return published
+            return native_git(root, *args)
+        native_run = subprocess.run
+        def run(command, **kwargs):
+            if command[:3] == ['git', 'fetch', 'origin']:
+                return subprocess.CompletedProcess(command, 0)
+            return native_run(command, **kwargs)
+        with patch.object(self.f, 'git', side_effect=observe), patch.object(self.f.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'expected-remote-sha'):
+                self.f.publication_plan(self.root, current)
+            with self.assertRaisesRegex(RuntimeError, 'remote tip changed'):
+                self.f.publication_plan(self.root, current, '0' * 40)
+            plan = self.f.publication_plan(self.root, current, published)
+        self.assertEqual(plan, {'remote_sha': published, 'options': [
+            '--force-with-lease=refs/heads/' + current['branch'] + ':' + published]})
+
+    def test_new_publication_does_not_invent_a_lease_or_accept_stale_expected_tip(self):
+        with patch.object(self.f, 'git', return_value=''):
+            self.assertEqual(self.f.publication_plan(self.root, {'branch': 'DEV-capitalism-slave-example'}),
+                             {'remote_sha': None, 'options': []})
+            with self.assertRaisesRegex(RuntimeError, 'remote tip changed'):
+                self.f.publication_plan(self.root, {'branch': 'DEV-capitalism-slave-example'}, 'a' * 40)
 
     def test_zero_oom_metrics_do_not_misclassify_actual_type_errors(self):
         command = [sys.executable, '-c', 'import json; print("error TS2304: broken symbol"); print(json.dumps({"oom_kill": 0})); raise SystemExit(1)']
@@ -280,6 +384,14 @@ class CIGateTests(unittest.TestCase):
         self.assertEqual(self.c.required_jobs(CI, ['apps/lucky-admin/src/a.vue']), {'Typecheck · Admin'})
         self.assertEqual(self.c.required_jobs(CI, ['README.md']), set())
 
+    def test_exchange_form_multiword_job_uses_its_actual_app(self):
+        ci = CI.replace('Typecheck · Admin:', 'Typecheck · Exchange Form:').replace(
+            './scripts/typecheck-app.sh payscrow-admin 0', './scripts/typecheck-app.sh exchange-form 0')
+        self.assertEqual(self.c.required_jobs(ci, ['lib/admin-layer/a.ts']),
+                         {'Tests · Admin', 'Typecheck · Exchange Form'})
+        with self.assertRaisesRegex(RuntimeError, 'entrypoint'):
+            self.c.required_jobs(ci.replace('exchange-form 0', 'payscrow-form 0'), ['lib/admin-layer/a.ts'])
+
     def test_changed_ci_selector_format_fails_closed(self):
         with self.assertRaisesRegex(RuntimeError, 'changes'):
             self.c.required_jobs(CI.replace('changes: &changes-admin', 'changes: *unknown'), ['lib/admin-layer/a.ts'])
@@ -304,6 +416,51 @@ class CIGateTests(unittest.TestCase):
     def test_empty_job_pipeline_is_not_green_proof(self):
         with self.assertRaisesRegex(RuntimeError, 'empty'):
             self.c.check_pipeline({'sha': 'a' * 40, 'status': 'success'}, [], 'a' * 40, set())
+
+    def test_review_only_mr_accepts_draft_conflict_but_never_wrong_identity(self):
+        mr = {'source_branch': 'DEV-capitalism-slave-feature', 'sha': 'a' * 40,
+              'target_branch': 'dev', 'state': 'opened', 'source_project_id': 1,
+              'target_project_id': 1, 'draft': True, 'has_conflicts': True,
+              'blocking_discussions_resolved': False}
+        self.c.validate_mr(mr, mr['source_branch'], mr['sha'], require_mergeable=False)
+        with self.assertRaisesRegex(RuntimeError, 'mergeable'):
+            self.c.validate_mr(mr, mr['source_branch'], mr['sha'])
+        with self.assertRaisesRegex(RuntimeError, 'source/target'):
+            self.c.validate_mr({**mr, 'target_branch': 'main'}, mr['source_branch'], mr['sha'], require_mergeable=False)
+
+    def test_wait_selects_mr_pipeline_not_a_newer_stand_trigger(self):
+        sha = 'a' * 40
+        branch = 'DEV-capitalism-slave-feature'
+        mr = {'source_branch': branch, 'sha': sha, 'target_branch': 'dev',
+              'state': 'opened', 'source_project_id': 1, 'target_project_id': 1}
+        jobs = [{'id': 10, 'name': 'Tests · Admin', 'status': 'success', 'allow_failure': False}]
+        for status in ('success', 'failed'):
+            with self.subTest(status=status), patch.object(self.c, 'Forge') as forge, patch.object(self.c, 'pipeline_jobs', return_value=jobs):
+                forge.return_value.mr.return_value = mr
+                forge.return_value.pages.return_value = [
+                    {'id': 1, 'sha': sha, 'source': 'merge_request_event', 'status': status},
+                    {'id': 2, 'sha': sha, 'source': 'trigger', 'status': 'success'},
+                ]
+                if status == 'failed':
+                    with self.assertRaisesRegex(RuntimeError, 'CI pipeline 1: failed'):
+                        self.c.wait_for_ci(Path('.'), 42, branch, sha, {'Tests · Admin'}, seconds=0)
+                else:
+                    result = self.c.wait_for_ci(Path('.'), 42, branch, sha, {'Tests · Admin'}, seconds=0)
+                    self.assertEqual(result['pipeline']['id'], 1)
+
+    def test_stand_trigger_does_not_replace_a_missing_mr_pipeline(self):
+        sha = 'a' * 40
+        branch = 'DEV-capitalism-slave-feature'
+        mr = {'source_branch': branch, 'sha': sha, 'target_branch': 'dev',
+              'state': 'opened', 'source_project_id': 1, 'target_project_id': 1}
+        with patch.object(self.c, 'Forge') as forge, patch.object(self.c, 'pipeline_jobs') as jobs:
+            forge.return_value.mr.return_value = mr
+            forge.return_value.pages.return_value = [
+                {'id': 2, 'sha': sha, 'source': 'trigger', 'status': 'success'},
+            ]
+            with self.assertRaisesRegex(RuntimeError, 'pending/missing'):
+                self.c.wait_for_ci(Path('.'), 42, branch, sha, {'Tests · Admin'}, seconds=0)
+            jobs.assert_not_called()
 
     def test_automatic_merge_preserves_source_and_pins_sha(self):
         args = self.c.merge_args('42', 'a' * 40)

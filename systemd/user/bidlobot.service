@@ -1,0 +1,27 @@
+[Unit]
+Description=BidloBot Telegram bot
+Documentation=https://github.com/BYDLOKOD/bidlobot
+# No network-online.target in the user manager; the bot tolerates a dead
+# network at startup and Restart=always covers a hard failure.
+After=default.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/bidlobot/env
+# yt-dlp is pinned to 2026.03.17 in the private bin dir and MUST win over
+# /usr/bin/yt-dlp (2026.08.19), whose TikTok extractor is broken by the
+# 2026-08-10 anti-bot change (yt-dlp#17403). Bun's bin dir supplies omp.
+Environment=PATH=%h/.local/lib/bidlobot/bin:%h/.cache/.bun/bin:/usr/local/bin:/usr/bin
+# Keep TikTok/X scratch files off the 16G tmpfs: a leaked work dir would
+# otherwise sit in RAM until reboot.
+Environment=TMPDIR=%h/.local/share/bidlobot/tmp
+WorkingDirectory=%h/.local/share/bidlobot
+ExecStart=%h/.local/lib/bidlobot/bin/bidlobot
+Restart=always
+RestartSec=10s
+# Matches App.ShutdownTimeout + in-flight drain + bbolt close.
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

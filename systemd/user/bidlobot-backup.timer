@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily BidloBot bbolt snapshot
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+# The desktop is off some nights, so a missed 04:17 must not be skipped
+# silently - Persistent replays it on the next boot.
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

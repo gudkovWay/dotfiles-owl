@@ -91,20 +91,20 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaises(guard.GuardError):
             guard.admission(state, 20 * G, G)
 
-    def test_reservations_and_eight_job_limit_bound_admission(self):
+    def test_unused_promises_and_eight_job_backstop_bound_admission(self):
         state = {'budget': 6 * G, 'jobs': {SCOPE: job(), OTHER: job()}}
         with self.assertRaises(guard.Busy):
-            guard.admission(state, 5 * G, G, {SCOPE: G, OTHER: G})
-        names = ['omp-heavy-job-' + f'{number:032x}' + '.scope' for number in range(8)]
-        state = {'budget': 24 * G, 'jobs': {name: job() for name in names}}
-        with self.assertRaises(guard.Busy):
-            guard.admission(state, 30 * G, G, {name: G for name in names})
+            guard.admission(state, 6 * G, 2 * G, {SCOPE: G, OTHER: G})
+        state = {'budget': 8 * G, 'jobs': {
+            'omp-heavy-job-' + f'{n:032x}' + '.scope': job(G) for n in range(8)}}
+        with self.assertRaisesRegex(guard.Busy, 'job_slots'):
+            guard.admission(state, 30 * G, G, {name: 0 for name in state['jobs']})
 
-    def test_existing_parent_cap_is_retained_but_fresh_admission_checks_available_ram(self):
-        self.assertEqual(guard.admission({'budget': 16 * G, 'jobs': {}}, 8 * G, 3 * G), 16 * G)
-        self.assertEqual(guard.admission({'budget': 0, 'jobs': {}}, 8 * G, 3 * G), 7 * G)
+    def test_old_parent_cap_does_not_bypass_fresh_admission(self):
+        state = {'budget': 16 * G, 'jobs': {}}
+        self.assertEqual(guard.admission(state, 8 * G, 3 * G), 16 * G)
         with self.assertRaises(guard.Busy):
-            guard.admission({'budget': 16 * G, 'jobs': {}}, 3 * G, 3 * G)
+            guard.admission(state, 3 * G, 3 * G)
 
     def test_memory_request_is_not_silently_clamped(self):
         for value in ['0', '-1G', 'infinity', '80%']:
@@ -120,16 +120,16 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaises(guard.Busy):
             guard.admission(state, 10 * G, 12 * G)
         state = {'budget': 16 * G, 'jobs': {SCOPE: job(12 * G)}}
+        self.assertEqual(guard.admission(state, 20 * G, 8 * G, {SCOPE: 12 * G}), 31 * G)
         with self.assertRaises(guard.Busy):
             guard.admission(state, 20 * G, 20 * G, {SCOPE: 12 * G})
         self.assertEqual(guard.admission(state, 20 * G, 4 * G, {SCOPE: 12 * G}), 31 * G)
 
     def test_budget_rounds_down_and_rejects_invalid_memory_accounting(self):
-        for available in (0, 1, G, 3 * G + 123, 20 * G - 1):
-            budget = guard.available_budget(available)
-            safe = max(0, available - G)
-            self.assertLessEqual(budget, safe)
-            self.assertLess(safe - budget, guard.STEP)
+        cases = ((0, 0), (1, 0), (G, 0), (3 * G + 123, 2 * G), (20 * G - 1, 75 * G // 4))
+        for available, expected in cases:
+            with self.subTest(available=available):
+                self.assertEqual(guard.available_budget(available), expected)
         for available in (-1, None, True, 1.5):
             with self.subTest(available=available), self.assertRaises(guard.GuardError):
                 guard.available_budget(available)
@@ -140,7 +140,7 @@ class BudgetTests(unittest.TestCase):
 
 
 class AllocationTests(unittest.TestCase):
-    def test_default_reserves_expected_peak_plus_buffer_not_all_free_ram(self):
+    def test_default_reserves_expected_peak_and_buffer_not_all_available_ram(self):
         state = {'budget': 0, 'jobs': {}}
         self.assertEqual(guard.allocate_memory(state, 20 * G, None, {}),
                          (19 * G, 11 * G // 4, 19 * G // 8))
@@ -148,7 +148,7 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(guard.allocate_memory(state, 20 * G, 4 * G, {}),
                          (19 * G, 4 * G, 4 * G * 2 // 3))
 
-    def test_default_accounts_for_every_live_unused_promise(self):
+    def test_default_uses_remaining_epoch_capacity_and_prevents_double_reservation(self):
         state = {'budget': 8 * G, 'jobs': {SCOPE: job()}}
         original = copy.deepcopy(state)
         self.assertEqual(guard.allocate_memory(state, 20 * G, None, {SCOPE: G}),
@@ -156,14 +156,15 @@ class AllocationTests(unittest.TestCase):
         self.assertEqual(state, original)
         state['jobs'][OTHER] = job(5 * G)
         with self.assertRaises(guard.Busy):
-            guard.allocate_memory(state, 9 * G, None, {SCOPE: G, OTHER: G})
+            guard.allocate_memory(state, 8 * G, None, {SCOPE: G, OTHER: G})
 
     def test_adaptive_maximum_is_bounded_by_fresh_ram_and_reserved_headroom(self):
         state = {'budget': 16 * G, 'jobs': {SCOPE: job()}}
         self.assertEqual(guard.allocate_memory(state, 6 * G, None, {SCOPE: G}),
                          (16 * G, 11 * G // 4, 19 * G // 8))
-        with self.assertRaises(guard.Busy):
-            guard.allocate_memory(state, 5 * G, None, {SCOPE: G})
+        for available in (4 * G, 5 * G):
+            with self.assertRaises(guard.Busy):
+                guard.allocate_memory(state, available, None, {SCOPE: G})
         with self.assertRaises(guard.GuardError):
             guard.allocate_memory(state, 20 * G, None, {})
         with self.assertRaises(guard.Busy):
@@ -353,6 +354,23 @@ class CliTests(unittest.TestCase):
         both = self.launch_options(['--memory', '6G', '--approved-double', '--approved-no-timeout'])
         self.assertEqual((both.memory, both.runtime), (12 * G, 'infinity'))
 
+    def test_zero_runtime_is_unlimited_without_changing_resource_limits(self):
+        options = self.launch_options(['--runtime', '0', '--need', '3G', '--tasks', '512'])
+        self.assertEqual(options.runtime, 'infinity')
+        self.assertEqual(options.need, 3 * G)
+        self.assertEqual(options.tasks, 512)
+        self.assertIsNone(options.memory)
+
+    def test_nested_zero_runtime_cannot_extend_finite_parent(self):
+        with patch.object(sys, 'argv', ['guarded-run', '--runtime', '0', '--', '/usr/bin/true']), \
+                patch.object(guard, 'current_cgroup', return_value='/omp-heavy.slice/' + SCOPE), \
+                patch.object(guard, 'assert_guarded', return_value=SCOPE), \
+                patch.object(guard, 'Registry') as registry:
+            registry.return_value.lock.return_value = contextlib.nullcontext()
+            registry.return_value.load.return_value = {'jobs': {SCOPE: {**job(), 'runtime': 600}}}
+            with self.assertRaisesRegex(guard.GuardError, 'runtime'):
+                guard.main()
+
     def test_second_admission_window_does_not_extend_runtime_or_caps(self):
         args = self.launch_options(['--wait', '60', '--admission-windows', '2', '--memory', '3G'])
         self.assertEqual((args.wait, args.admission_windows, args.runtime, args.memory),
@@ -379,13 +397,13 @@ class LifecycleTests(unittest.TestCase):
         self.run_lifecycle(600, memory=None)
 
     def run_lifecycle(self, runtime, memory=6 * G):
+        import resource_executor as executor
         with tempfile.TemporaryDirectory() as directory:
             registry = guard.Registry(Path(directory))
             other = guard.Registry(Path(directory))
             backend = guard.Systemd()
             marker = Path(directory) / 'launched'
             start = guard.start_launcher
-            import resource_executor as executor
             cleanup = executor.cleanup_launcher
 
             def launch(*args):
@@ -399,8 +417,8 @@ class LifecycleTests(unittest.TestCase):
                 with other.lock():
                     jobs = other.load()['jobs']
                     self.assertEqual(len(jobs), 1)
-                    self.assertEqual(next(iter(jobs.values()))['runtime'], runtime)
                     reservation = next(iter(jobs.values()))
+                    self.assertEqual(reservation['runtime'], runtime)
                     self.assertEqual(reservation['limit'], 11 * G // 4 if memory is None else memory)
                     self.assertEqual(reservation['memory_high'],
                                      19 * G // 8 if memory is None else memory * 2 // 3)
@@ -415,11 +433,9 @@ class LifecycleTests(unittest.TestCase):
                     patch.object(backend, 'configure_slice'), \
                     patch.object(backend, 'units', return_value=[]), \
                     patch.object(backend, 'populated', return_value=False), \
-                    patch.object(guard, 'heavy_processes', return_value=[]), \
                     patch.object(guard, 'mem_available', return_value=10 * G), \
                     patch.object(guard, 'scope_command', return_value=['/usr/bin/touch', str(marker)]), \
                     patch.object(guard, 'start_launcher', side_effect=launch), \
-                    patch.object(executor.signal, 'signal'), \
                     patch.object(executor, 'cleanup_launcher', side_effect=teardown):
                 self.assertEqual(guard.execute(args, ['/usr/bin/touch', str(marker)], ''), 0)
             self.assertEqual(registry.load()['jobs'], {})
@@ -532,7 +548,7 @@ class CapsTests(unittest.TestCase):
         self.assertIn('MemoryMax=6442450944', properties)
         self.assertIn('OOMPolicy=kill', properties)
         self.assertIn('MemorySwapMax=0', properties)
-        self.assertIn(f'CPUQuota={guard.CPU_COUNT * 100}%', properties)
+        self.assertIn(f'CPUQuota={max(1, (os.cpu_count() or 2) - 2) * 100}%', properties)
         self.assertIn('TasksMax=256', properties)
 
     def test_reclaimable_cache_does_not_reduce_reserved_headroom(self):
@@ -584,9 +600,9 @@ class PidProfileTests(unittest.TestCase):
         state = {'jobs': {'running': {'tasks': 1792}}, 'queue': [
             {'id': 'ui', 'tasks': 512, 'deadline': 100, 'keys': [], 'enqueued_at': 0, 'required': G, 'goal': 'a'},
             {'id': 'small', 'tasks': 256, 'deadline': 100, 'keys': [], 'enqueued_at': 1, 'required': G, 'goal': 'b'}]}
-        self.assertEqual(policy.queue_choice(state, 2 * G, set(), 2), 'small')
+        self.assertEqual(policy.queue_choice(state, 2 * G, set(), 2)['selected'], 'small')
         state['jobs']['running']['tasks'] = 2048
-        self.assertIsNone(policy.queue_choice(state, 2 * G, set(), 2))
+        self.assertIsNone(policy.queue_choice(state, 2 * G, set(), 2)['selected'])
 
     def test_registry_keeps_pid_measurements_and_rejects_overcommit(self):
         reservation = {**job(), 'tasks': 512, 'pids_peak': 107, 'pids_events': 0}

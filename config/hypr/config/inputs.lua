@@ -14,6 +14,9 @@ hl.config({
 		repeat_rate = 55,
 
 		follow_mouse = 1,
+		-- Keep hover focus between windows, but do not reclaim keyboard focus
+		-- from an open shell panel while the pointer stays over the same window.
+		mouse_refocus = false,
 
 		sensitivity = 0, -- -1.0 - 1.0, 0 means no modification.
 

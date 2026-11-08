@@ -67,6 +67,33 @@ class ReviewContractTests(unittest.TestCase):
         self.write_session()
         self.contract.validate_context(self.context)
 
+    def test_operational_intent_does_not_invalidate_source_review(self):
+        for text in ('Останови превью.', 'Запусти превью', 'Финализируй', 'Создай MR', 'Не мержи'):
+            self.entries.append({'type': 'message', 'message': {'role': 'user', 'content': text}})
+        self.write_session()
+        fresh = self.contract.capture_context([self.session])
+        self.assertEqual(fresh['context_key'], self.context['context_key'])
+        self.assertEqual([item['text'] for item in fresh['operations']],
+                         ['Останови превью.', 'Запусти превью', 'Финализируй', 'Создай MR', 'Не мержи'])
+        self.assertEqual(self.contract.validate_context(self.context)['operations'], fresh['operations'])
+        self.contract.validate_review(self.root, self.report(), ['new.vue'], self.context)
+
+    def test_mixed_or_unknown_instruction_is_never_discarded_as_operational(self):
+        for text in ('Останови превью и убери кнопку.', 'Финализируй, но измени поиск', 'Давай иначе'):
+            with self.subTest(text=text):
+                self.entries.append({'type': 'message', 'message': {'role': 'user', 'content': text}})
+                self.write_session()
+                with self.assertRaisesRegex(RuntimeError, 'context changed'):
+                    self.contract.validate_context(self.context)
+                self.entries.pop()
+
+    def test_jsonl_unicode_line_separator_does_not_drop_owner_request(self):
+        self.entries[-1]['message']['content'] = 'Сохрани поиск\u2028и ширину\u2029без прыжка'
+        self.session.write_text(''.join(json.dumps(entry, ensure_ascii=False) + '\n' for entry in self.entries))
+        context = self.contract.capture_context([self.session])
+        self.assertIn('Сохрани поиск\u2028и ширину\u2029без прыжка',
+                      [item['text'] for item in context['requirements']])
+
     def test_report_preserves_established_reference_without_per_cell_approval_document(self):
         self.contract.validate_review(self.root, self.report(), ['new.vue'], self.context)
 

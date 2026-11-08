@@ -96,6 +96,59 @@ class BatchFlow(unittest.TestCase):
             with self.b.lock():
                 return self.b.check()
 
+    def test_begin_does_not_require_cleanup_access_to_unrelated_processes(self):
+        original = Path.iterdir
+        def restricted(path):
+            if path == Path('/proc'):
+                raise PermissionError('unrelated process inventory is unavailable')
+            return original(path)
+        with patch.object(Path, 'iterdir', restricted):
+            self.begin()
+        self.assertTrue(self.b.load()['active'])
+
+    def test_refresh_after_rebase_replaces_stale_proof(self):
+        self.begin()
+        self.commit()
+        self.verify()
+        old = self.b.load()
+        (self.repo / 'upstream.js').write_text('const upstream = 1;\n')
+        git(self.repo, 'add', 'upstream.js')
+        git(self.repo, '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'upstream')
+        git(self.tree, 'rebase', 'dev')
+        with self.assertRaises(batch.Refused):
+            self.check()
+        with self.b.lock():
+            self.b.begin('dev', refresh=True)
+        refreshed = self.b.load()
+        self.assertNotEqual(refreshed['base_sha'], old['base_sha'])
+        self.assertEqual(refreshed['start'], self.b.head())
+        self.assertIsNone(refreshed['receipt'])
+        with self.assertRaises(batch.Refused):
+            self.check()
+        self.verify()
+        self.check()
+
+    def test_failed_initial_state_save_does_not_leave_registration(self):
+        with patch.object(self.b, 'save', side_effect=OSError('disk full')):
+            with self.b.lock(), self.assertRaises(OSError):
+                self.b.begin('dev')
+        self.assertFalse(self.b.marker.exists())
+        self.assertFalse(self.b.state_path.exists())
+        self.begin()
+
+    def test_refresh_recovers_interrupted_registration_without_reusing_proof(self):
+        for missing in ('marker', 'state_path'):
+            with self.subTest(missing=missing):
+                if not self.b.state_path.exists() and not self.b.marker.exists():
+                    self.begin()
+                getattr(self.b, missing).unlink()
+                with self.assertRaises(batch.Refused):
+                    self.check()
+                with self.b.lock():
+                    self.b.begin('dev', refresh=True)
+                self.assertTrue(self.b.load()['active'])
+                self.assertIsNone(self.b.load()['receipt'])
+
     def test_multiple_atomic_commits_and_cumulative_selection(self):
         self.begin()
         self.commit()
@@ -279,6 +332,36 @@ class BatchFlow(unittest.TestCase):
         with self.assertRaises(batch.Refused):
             with self.b.lock():
                 self.b.push(['--all'])
+
+    def test_exact_lease_preserves_batch_proof_and_remote_race_guard(self):
+        self.begin()
+        self.commit()
+        remote = self.root / 'remote.git'
+        git(self.repo, 'init', '--bare', '-q', str(remote))
+        git(self.repo, 'remote', 'add', 'fixture', str(remote))
+        ref = 'refs/heads/' + self.b.branch
+        old = git(self.tree, 'commit-tree', 'HEAD^{tree}', '-p', 'dev', '-m', 'published sibling')
+        git(self.tree, 'push', 'fixture', old + ':' + ref)
+        args = ['--force-with-lease=' + ref + ':' + old, 'fixture', self.b.branch]
+        with self.assertRaises(batch.Refused):
+            self.b.push(args)
+        self.assertEqual(git(remote, 'rev-parse', ref), old)
+        self.verify()
+        with patch.object(self.b, 'environment_key', return_value='ready'):
+            with self.b.lock():
+                stale = '--force-with-lease=' + ref + ':' + git(self.tree, 'rev-parse', 'dev')
+                self.assertNotEqual(self.b.push([stale, 'fixture', self.b.branch]), 0)
+                self.assertEqual(git(remote, 'rev-parse', ref), old)
+                self.assertTrue(self.b.load()['active'])
+                self.assertEqual(self.b.push(args), 0)
+        self.assertEqual(git(remote, 'rev-parse', ref), git(self.tree, 'rev-parse', 'HEAD'))
+        self.assertFalse(self.b.load()['active'])
+
+    def test_lease_never_authorizes_integration_refs(self):
+        for branch in ('dev', 'main', 'master', 'release-1', 'refs/heads/task'):
+            with self.subTest(branch=branch), self.assertRaises(batch.Refused):
+                batch.push_args(['--force-with-lease=refs/heads/' + branch + ':' + 'a' * 40,
+                                 'fixture', branch], branch)
 
 
     def test_commit_cli_keeps_message_values_and_does_not_prepare(self):

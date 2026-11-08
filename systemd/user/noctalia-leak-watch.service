@@ -1,0 +1,13 @@
+[Unit]
+Description=Сэмплер кучи noctalia (атрибуция утечки, инцидент 19.09)
+# Пишет ~/.local/state/noctalia-leak/samples.log каждые 10 мин;
+# ключевая колонка data_kb (VmData). Скрипт сам перевыбирает живой
+# pid, рестарты/ребуты оболочки ряд не рвут.
+
+[Service]
+ExecStart=/home/q/.local/state/noctalia-leak/watch.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

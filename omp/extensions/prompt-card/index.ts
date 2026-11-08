@@ -1,56 +1,46 @@
 // OMP prompt-card integration: lifecycle, commands, shortcut, heartbeat timer.
 // Owns only orchestration; branch metadata extraction lives in ./model,
-// rendering in ./view. Styling is terminal-default fg/attributes only.
+// Rendering is a single foreground-only dock surface in ./view.
 import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { getLatestTodoPhasesFromEntries } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import { copyToClipboard } from "@oh-my-pi/pi-coding-agent/utils/clipboard";
 import type { TUI } from "@oh-my-pi/pi-tui";
 import {
-	DEFAULT_MOTION,
 	MOTION_ENTRY,
 	PIN_ENTRY,
 	RESPONDING_ENTRY,
 	readCardModel,
+	readCardPlan,
+	readPlanReference,
 	recordFromContent,
 	sectionText,
 	SUBMITTED_ENTRY,
-	type CardSnapshot,
-	type PromptRecord,
 } from "./model";
-import {
-	PROMPT_CARD_MARGIN,
-	PROMPT_CARD_WIDTH,
-	PromptCardPanel,
-	PromptCardViewer,
-	promptCardHeight,
-	type CardActions,
-} from "./view";
+import type { CardSnapshot, PromptRecord } from "./model";
+import type { CardActions } from "./view";
+import { ContextCard } from "./view";
 
 const WIDGET_KEY = "q.prompt-card.panel";
 const HEARTBEAT_MS = 250;
-const VIEWER_ABORT_NAME = "AbortError";
 
 function isMainTui(ctx: ExtensionContext): boolean {
 	return ctx.mode === "tui" && ctx.hasUI && ctx.agent.kind === "main";
 }
 
-function isAbortish(error: unknown): boolean {
-	if (error instanceof DOMException) return error.name === VIEWER_ABORT_NAME;
-	if (error instanceof Error) return error.name === VIEWER_ABORT_NAME;
-	return false;
-}
 
 export default function promptCardExtension(pi: ExtensionAPI): void {
 	// Field-for-field CardSnapshot: handed out by reference so renders never
 	// allocate a fresh snapshot object.
 	const state: CardSnapshot = {
-		model: { motion: DEFAULT_MOTION },
+		model: readCardModel([]),
 		busy: false,
 		pending: false,
 		waiting: false,
 		frame: 0,
+		session: { id: "", cwd: "" },
 	};
 
 	// Prompt staged by before_agent_start, confirmed against an actually
@@ -60,11 +50,20 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 	let staged: PromptRecord | undefined;
 	let heartbeat: Timer | undefined;
 	let heartbeatOwner: ExtensionContext | undefined;
-	let viewerOpen = false;
-	let viewerAbort: AbortController | undefined;
+	let card: ContextCard | undefined;
 	let tui: TUI | undefined;
+	let panelOwner: ExtensionContext | undefined;
+	let planLeaf: string | null | undefined;
 
 	function getSnapshot(): CardSnapshot {
+		// Native todo edits (including /todo and eval) are durable branch entries.
+		// Re-read only when that branch changes; rendering never polls an idle timer.
+		if (panelOwner && panelOwner.sessionManager.getLeafId() !== planLeaf) {
+			const branch = panelOwner.sessionManager.getBranch();
+			state.model = { ...state.model, plan: readCardPlan(getLatestTodoPhasesFromEntries(branch)) };
+			state.planReference = panelOwner.getPendingPlanReview()?.planFilePath ?? readPlanReference(branch);
+			planLeaf = panelOwner.sessionManager.getLeafId();
+		}
 		return state;
 	}
 
@@ -77,6 +76,13 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 	}
 
 	function reconcile(ctx: ExtensionContext): void {
+		const id = ctx.sessionManager.getSessionId();
+		const name = ctx.sessionManager.getSessionName();
+		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+		const effort = pi.getThinkingLevel();
+		const old = state.session;
+		if (old.id !== id || old.cwd !== ctx.cwd || old.name !== name || old.model !== model || old.effort !== effort)
+			state.session = { id, cwd: ctx.cwd, name, model, effort };
 		state.busy = !ctx.isIdle();
 		state.pending = ctx.hasPendingMessages();
 		// Timer is strictly a functional progress animation: main interactive
@@ -99,23 +105,35 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 	}
 
 	function refreshModel(ctx: ExtensionContext): void {
-		state.model = readCardModel(ctx.sessionManager.getBranch());
+		const branch = ctx.sessionManager.getBranch();
+		state.model = readCardModel(branch);
+		state.planReference = ctx.getPendingPlanReview()?.planFilePath ?? readPlanReference(branch);
+		planLeaf = ctx.sessionManager.getLeafId();
 	}
 
 	function mountPanel(ctx: ExtensionContext): void {
-		// Permanent passive card above the composer; the widget holds no focus
-		// and never touches the editor, footer, theme, or title. Its height
-		// follows the live terminal rows, so the core-managed widget stays a
-		// compact card. Core clears widgets on session change, so every
-		// main-TUI restore re-registers.
-		ctx.ui.setWidget(
-			WIDGET_KEY,
-			(tuiInstance) => {
-				tui = tuiInstance;
-				return new PromptCardPanel(getSnapshot, () => tuiInstance.terminal.rows);
+		card?.dispose();
+		panelOwner = ctx;
+		const actions: CardActions = {
+			copy: copyToClipboard,
+			pin: text => {
+				if (text === state.model.pin) return;
+				pi.appendEntry(PIN_ENTRY, { text });
+				state.model = { ...state.model, pin: text };
+				tui?.requestRender();
 			},
-			{ placement: "aboveEditor" },
-		);
+			unpin: () => {
+				if (state.model.pin === undefined) return;
+				pi.appendEntry(PIN_ENTRY);
+				state.model = { ...state.model, pin: undefined };
+				tui?.requestRender();
+			},
+		};
+		ctx.ui.setWidget(WIDGET_KEY, tuiInstance => {
+			tui = tuiInstance;
+			card = new ContextCard(getSnapshot, () => tuiInstance.terminal.rows, tuiInstance, actions);
+			return card;
+		}, { placement: "aboveEditor" });
 	}
 
 	function restore(ctx: ExtensionContext): void {
@@ -134,76 +152,14 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 	}
 
 	function closeViewer(): void {
-		if (viewerAbort !== undefined) {
-			viewerAbort.abort();
-			viewerAbort = undefined;
-		}
-		viewerOpen = false;
+		card?.close();
 	}
 
 	function openViewer(ctx: ExtensionContext): void {
-		if (!isMainTui(ctx) || viewerOpen) return;
+		if (!isMainTui(ctx)) return;
 		refreshModel(ctx);
-		const controller = new AbortController();
-		viewerAbort = controller;
-		viewerOpen = true;
-		void ctx.ui
-			.custom<void>(
-				(tuiInstance, _theme, _keybindings, done) => {
-					tui = tuiInstance;
-					// Actions close over the factory's done callback, so no fake
-					// initial no-op wiring is needed.
-					const actions: CardActions = {
-						close: () => done(),
-						copy: (text: string) => copyToClipboard(text),
-						pin: (text: string) => {
-							pi.appendEntry(PIN_ENTRY, { text });
-							state.model = { ...state.model, pin: text };
-							tui?.requestRender();
-						},
-						unpin: () => {
-							pi.appendEntry(PIN_ENTRY);
-							state.model = { ...state.model, pin: undefined };
-							tui?.requestRender();
-						},
-					};
-					return new PromptCardViewer(
-						getSnapshot,
-						() => promptCardHeight(tuiInstance.terminal.rows),
-						() => tuiInstance.requestRender(),
-						actions,
-					);
-				},
-				// Compact panel anchored bottom-right, above the composer: the
-				// preferred width is 76 columns and the margins reserve room for
-				// the panel/editor below and a one-row gap above. Core clamps
-				// both to the available pane, and getRows() returns a height the
-				// same margins already fit, so the overlay is never core-sliced.
-				{
-					overlay: true,
-					signal: controller.signal,
-					overlayOptions: {
-						anchor: "bottom-right",
-						width: PROMPT_CARD_WIDTH,
-						margin: PROMPT_CARD_MARGIN,
-					},
-				},
-			)
-			.catch((error: unknown) => {
-				// Session switches and shutdown abort the overlay: expected. Real
-				// failures must be visible, not silent.
-				if (!isAbortish(error)) {
-					ctx.ui.notify(`prompt-card: ${error instanceof Error ? error.message : String(error)}`, "error");
-				}
-			})
-			.finally(() => {
-				// An old aborted finalizer must never clear a newer modal's guard
-				// mounted after a session switch.
-				if (viewerAbort === controller) {
-					viewerAbort = undefined;
-					viewerOpen = false;
-				}
-			});
+		reconcile(ctx);
+		card?.open();
 	}
 
 	function pinFromCommand(ctx: ExtensionContext, rest: string): void {
@@ -237,9 +193,12 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_compact", (_event, ctx) => {
-		// Custom entries persist across compaction; rebuild to drop state
-		// before any reset_boundary and keep the rest.
-		restore(ctx);
+
+		if (!isMainTui(ctx)) return;
+		// Same session and dock: do not reset the selected tab, scroll or collapse.
+		refreshModel(ctx);
+		reconcile(ctx);
+		tui?.requestRender();
 	});
 
 	pi.on("session_before_switch", (_event, _ctx) => {
@@ -347,6 +306,7 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 		// live context so the heartbeat survives deferred follow-ups and stops
 		// once genuinely idle. A terminal settle resets transient states.
 		reconcile(ctx);
+		refreshModel(ctx);
 		if (!state.busy) {
 			staged = undefined;
 			state.waiting = false;
@@ -359,6 +319,7 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 		// Static waiting indicator: freeze the animation timer instead of
 		// ticking through the wait.
 		state.waiting = true;
+		closeViewer();
 		stopHeartbeat();
 		tui?.requestRender();
 	});
@@ -367,6 +328,19 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 		if (!isMainTui(ctx)) return;
 		state.waiting = false;
 		reconcile(ctx);
+		tui?.requestRender();
+	});
+
+	pi.on("tool_result", (_event, ctx) => {
+		if (!isMainTui(ctx)) return;
+		// The render reads canonical persisted todo state, including eval commits.
+		reconcile(ctx);
+		tui?.requestRender();
+	});
+
+	pi.on("plan_review_requested", (event, ctx) => {
+		if (!isMainTui(ctx)) return;
+		state.planReference = event.planFilePath;
 		tui?.requestRender();
 	});
 
@@ -395,6 +369,26 @@ export default function promptCardExtension(pi: ExtensionAPI): void {
 			},
 		},
 	);
+
+	pi.registerCommand("sid", {
+		description: "Copy the full current OMP session UUID: /sid copy",
+		handler: async (args, ctx) => {
+			if (!isMainTui(ctx)) return;
+			if (args.trim() !== "copy") {
+				ctx.ui.notify("Usage: /sid copy", "warning");
+				return;
+			}
+			const id = ctx.sessionManager.getSessionId();
+			try {
+
+				await copyToClipboard(id);
+				if (ctx.sessionManager.getSessionId() === id) ctx.ui.notify("Полный ID сессии скопирован", "info");
+			} catch (error) {
+				if (ctx.sessionManager.getSessionId() === id)
+					ctx.ui.notify(`Ошибка clipboard: ${error instanceof Error ? error.message : String(error)}`, "error");
+			}
+		},
+	});
 
 	pi.registerCommand("prompt", {
 		description: "Prompt card: viewer, pin/unpin objective, motion on|off",

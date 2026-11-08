@@ -1,10 +1,9 @@
 source /usr/share/cachyos-fish-config/cachyos-config.fish
 
-# overwrite greeting
-# potentially disabling fastfetch
-#function fish_greeting
-#    # smth smth
-#end
+# Keep the CachyOS greeting, but do not expose local network addresses.
+function fish_greeting
+    fastfetch --structure-disabled LocalIp
+end
 
 # --- abbreviations ---
 # разворачиваются прямо в строке при пробеле/enter, так что можно дописать аргументы
@@ -18,6 +17,11 @@ if status is-interactive
     abbr -a nrdpm 'npm run dev -w payscrow-merchant'
     abbr -a nrdpp 'npm run dev -w payscrow-provider'
 
+    abbr -a o omp
+    abbr -a ou omp update
+    abbr -a h herdr
+    abbr -a t tmux
+    abbr -a g git
     abbr -a ga  'git add .'
     abbr -a gc  --set-cursor -- 'git commit -m "%"'
     abbr -a gpd 'git push origin dev'

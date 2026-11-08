@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -29,8 +30,7 @@ class MergeGateTests(unittest.TestCase):
                                                     'snapshot': self.current, 'current_receipt': True,
                                                     'ci_requirements': {'Typecheck · Admin'}}),
                                     (mr, {'git': str(self.root), 'view': self.delivered,
-                                          'require_batch_proof': None, 'wait_for_ci': {'sha': self.sha},
-                                          'cleanup_remote': {'state': 'deleted'}})):
+                                          'require_batch_proof': None, 'wait_for_ci': {'sha': self.sha}})):
             for name, result in replacement.items():
                 mocked = patch.object(target, name, return_value=result)
                 setattr(self, name + '_mock', mocked.start())
@@ -42,11 +42,11 @@ class MergeGateTests(unittest.TestCase):
     def test_missing_receipt_runs_finalizer_without_merging(self):
         self.current_receipt_mock.return_value = False
         self.assertEqual(mr.merge_feature(self.opened, ['42']), 0)
-        self.assertEqual(self.call.call_args.args[0], [str(ROOT / 'feature-finalize'), '--mr', '42'])
+        self.assertEqual(self.call.call_args.args[0], [str(ROOT / 'feature-finalize'), '--mr', '42', '--merge'])
         self.wait_for_ci_mock.assert_not_called()
         self.require_batch_proof_mock.assert_not_called()
 
-    def test_valid_receipt_waits_ci_pins_merge_then_cleans_remote(self):
+    def test_valid_receipt_waits_ci_and_pins_merge_without_cleanup(self):
         self.assertEqual(mr.merge_feature(self.opened, ['42']), 0)
         self.wait_for_ci_mock.assert_called_once()
         args = self.call.call_args.args[0]
@@ -54,25 +54,15 @@ class MergeGateTests(unittest.TestCase):
         self.assertIn('--remove-source-branch=false', args)
         self.assertIn('--auto-merge=false', args)
         self.assertEqual(self.call.call_count, 1)
-        self.cleanup_remote_mock.assert_called_once_with(self.delivered)
 
-    def test_keep_source_branch_does_not_clean_remote(self):
-        self.assertEqual(mr.merge_feature(self.opened, ['42', '--keep-source-branch']), 0)
-        self.cleanup_remote_mock.assert_not_called()
-
-    def test_pending_cleanup_does_not_turn_confirmed_merge_into_failure(self):
-        self.cleanup_remote_mock.side_effect = RuntimeError('source ref still has active pipeline consumers')
-        self.assertEqual(mr.merge_feature(self.opened, ['42']), 0)
-        self.assertEqual(self.call.call_count, 1)
-
-    def test_hotfix_requires_review_unless_owner_explicitly_opts_out(self):
+    def test_hotfix_requires_the_same_sol_receipt_and_ci_gates(self):
         self.current['branch'] = 'DEV-capitalism-slave-hotfix-one'
         self.opened['source_branch'] = self.current['branch']
-        self.current_receipt_mock.return_value = False
         mr.merge_feature(self.opened, ['42'])
-        self.current_receipt_mock.assert_called_once()
-        self.wait_for_ci_mock.assert_not_called()
-        self.assertEqual(self.call.call_args.args[0][0], str(ROOT / 'feature-finalize'))
+        self.current_receipt_mock.assert_called()
+        self.wait_for_ci_mock.assert_called_once()
+        self.require_batch_proof_mock.assert_called_once()
+        self.assertEqual(self.call.call_args.args[0][1:3], ['mr', 'merge'])
 
     def test_failed_ci_never_calls_merge(self):
         self.wait_for_ci_mock.side_effect = RuntimeError('mandatory typecheck failed')
@@ -105,6 +95,39 @@ class MergeGateTests(unittest.TestCase):
     def test_creation_preserves_source_even_if_old_default_requested_delete(self):
         self.assertEqual(mr.remove_source_args(['--remove-source-branch=true', '--title', 'feature']),
                          ['--title', 'feature', '--remove-source-branch=false'])
+
+class ProcessOwnershipTests(unittest.TestCase):
+    def test_user_manager_deserialize_flag_is_not_a_worktree_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = Path(directory) / '1009'
+            process.mkdir()
+            (process / 'stat').write_text('1009 (systemd) S 1 1009 1009 0\n')
+            for command in (
+                b'/usr/lib/systemd/systemd\0--user\0',
+                b'/usr/lib/systemd/systemd\0--user\0--deserialize=38\0',
+            ):
+                (process / 'cmdline').write_bytes(command)
+                self.assertTrue(mr.session_manager(process))
+            for command in (
+                b'/usr/lib/systemd/systemd\0--user\0--deserialize=bad\0',
+                b'/usr/lib/systemd/systemd\0--user\0--unreviewed\0',
+                b'/tmp/systemd\0--user\0--deserialize=38\0',
+            ):
+                (process / 'cmdline').write_bytes(command)
+                self.assertFalse(mr.session_manager(process))
+            (process / 'cmdline').write_bytes(b'/usr/lib/systemd/systemd\0--user\0')
+            (process / 'stat').write_text('1009 (systemd) S 2000 1009 1009 0\n')
+            self.assertFalse(mr.session_manager(process))
+
+    def test_unreadable_unknown_process_still_blocks_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = Path(directory) / '1009'
+            process.mkdir()
+            with patch.object(mr, 'ancestors', return_value=set()), \
+                    patch.object(mr.Path, 'iterdir', return_value=iter([process])), \
+                    patch.object(mr, 'session_manager', side_effect=PermissionError('denied')):
+                with self.assertRaisesRegex(mr.Deferred, 'cannot establish process ownership: 1009'):
+                    mr.ensure_idle(Path(directory))
 
 
 if __name__ == '__main__':
